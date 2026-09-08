@@ -1,7 +1,0 @@
-# render.yaml
-services:
-  - type: web
-    name: s3-uploader
-    env: docker
-    plan: free
-    healthCheckPath: /health
