@@ -118,7 +118,7 @@ app.get('/health', (req, res) => res.json({ status: 'healthy' }));
 app.listen(10000, () => console.log('Web on 10000'));
 
 setInterval(() => {
-    axios.get('https://s3-uploader.onrender.com/health', { timeout: 10000 }).catch(() => {});
+    axios.get('https://s3-bot-pjpo.onrender.com/health', { timeout: 10000 }).catch(() => {});
 }, 300000);
 
 bot.start();
