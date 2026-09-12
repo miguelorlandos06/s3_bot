@@ -1,8 +1,10 @@
-// package.json
 {
   "name": "s3upld-bot",
   "version": "2.0.0",
   "main": "index.js",
+  "scripts": {
+    "start": "node index.js"
+  },
   "dependencies": {
     "grammy": "^1.30.0",
     "axios": "^1.7.0",
