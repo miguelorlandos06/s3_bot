@@ -54,7 +54,7 @@ function getFilenameFromUrl(url) {
     return null;
 }
 
-// --- Cliente axios reutilizable con pool keep-alive ---
+// --- Cliente axios si reutilizable con pool keep-alive ---
 const http = require('http');
 const https = require('https');
 const agent = new https.Agent({ keepAlive: true, maxSockets: 64 });
