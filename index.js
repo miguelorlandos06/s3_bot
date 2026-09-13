@@ -8,7 +8,7 @@ const path = require('path');
 const crypto = require('crypto');
 const { pipeline } = require('stream/promises');
 
-const BOT_TOKEN = "8633754852:AAFI3Eesq3dy2MqSWFGndJ7MDrm4eVHHlpc";
+const BOT_TOKEN = "8935664196:AAFePCRuzC27eP4nb2LWTvoYaCWnQ60LMSE";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
 
