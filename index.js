@@ -61,7 +61,7 @@ const agent = new https.Agent({ keepAlive: true, maxSockets: 64 });
 const httpAgent = new http.Agent({ keepAlive: true, maxSockets: 64 });
 const client = axios.create({ httpAgent, httpsAgent: agent, timeout: 0 });
 
-// --- Cola global de trabajos (evita saturar disco/red) ---
+// --- Cola global de trabajos (evita saturar red) ---
 const MAX_CONCURRENT = 3;
 let running = 0;
 const queue = [];
