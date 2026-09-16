@@ -13,11 +13,15 @@ const { pipeline } = require('stream/promises');
 const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2 GB (servidor Bot API local)
+const TG_API_ROOT = "https://tg-api.onrender.com"; // nombre del servicio 1 en Render
+const SELF_URL = "https://todus-bot.onrender.com"; // URL de este mismo servicio en Render
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
-const bot = new Bot(BOT_TOKEN);
+const bot = new Bot(BOT_TOKEN, {
+    client: { apiRoot: TG_API_ROOT },
+});
 
 // ---------- Utilidades ----------
 function formatSize(b) {
@@ -191,7 +195,7 @@ async function descargarYSubir(ctx, url, statusMsg) {
     });
 }
 
-// ---------- Procesar archivo recibido ----------
+// ---------- Procesar archivo recibido (vía servidor local Bot API) ----------
 async function procesarArchivo(ctx, file, originalName, statusMsg) {
     return enqueue(async () => {
         const chatId = ctx.chat.id;
@@ -209,7 +213,10 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
         try {
             const fileInfo = await ctx.api.getFile(file.file_id);
             const filePath = fileInfo.file_path;
-            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+            // En modo local, file_path es una URL que apunta al servidor Bot API
+            // (no a api.telegram.org). grammY la construye con apiRoot + /file/bot...
+            const fileUrl = `${TG_API_ROOT}/file/bot${BOT_TOKEN}/${filePath}`;
 
             const res = await client.get(fileUrl, {
                 responseType: 'stream',
@@ -329,7 +336,7 @@ function extraerArchivo(msg) {
 // ---------- Handlers ----------
 bot.command('start', ctx =>
     ctx.reply(
-        "Envíame un enlace de descarga directa o un archivo (menor a 50 MB)."
+        "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
     )
 );
 
@@ -339,7 +346,7 @@ bot.on('message:text', async ctx => {
     const m = ctx.message.text.trim().match(URL_RE);
     if (!m) {
         try {
-            await ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).");
+            await ctx.reply("Envíame un enlace de descarga directa o un archivo (hasta 2 GB).");
         } catch {}
         return;
     }
@@ -388,7 +395,7 @@ bot.on(
     }
 );
 
-// ---------- Servidor web ----------
+// ---------- Servidor web + keep-alive ----------
 const app = express();
 app.get('/', (_q, r) => r.json({ status: 'online' }));
 app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
@@ -396,9 +403,10 @@ app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Web on ${PORT}`));
 
+// Self-ping cada 10 minutos para no dormir el servicio en Render
 setInterval(
-    () => client.get('https://s3-bot-pjpo.onrender.com/health').catch(() => {}),
-    300000
+    () => client.get(`${SELF_URL}/health`).catch(() => {}),
+    10 * 60 * 1000
 );
 
 // ---------- Arranque ----------
