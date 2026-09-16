@@ -14,8 +14,8 @@ const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
 const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2 GB (servidor Bot API local)
-const TG_API_ROOT = "https://tg-api.onrender.com"; // nombre del servicio 1 en Render
-const SELF_URL = "https://todus-bot.onrender.com"; // URL de este mismo servicio en Render
+const TG_API_ROOT = "https://tg-api-hrlr.onrender.com";
+const SELF_URL = "https://s3-bot-cgww.onrender.com";
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
@@ -213,9 +213,6 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
         try {
             const fileInfo = await ctx.api.getFile(file.file_id);
             const filePath = fileInfo.file_path;
-
-            // En modo local, file_path es una URL que apunta al servidor Bot API
-            // (no a api.telegram.org). grammY la construye con apiRoot + /file/bot...
             const fileUrl = `${TG_API_ROOT}/file/bot${BOT_TOKEN}/${filePath}`;
 
             const res = await client.get(fileUrl, {
@@ -403,10 +400,16 @@ app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Web on ${PORT}`));
 
-// Self-ping cada 10 minutos para no dormir el servicio en Render
+// Auto-ping #1: mantiene despierto ESTE servicio (el bot)
 setInterval(
     () => client.get(`${SELF_URL}/health`).catch(() => {}),
     10 * 60 * 1000
+);
+
+// Auto-ping #2: mantiene despierto el Bot API local
+setInterval(
+    () => client.get(`${TG_API_ROOT}/bot${BOT_TOKEN}/getMe`).catch(() => {}),
+    5 * 60 * 1000
 );
 
 // ---------- Arranque ----------
