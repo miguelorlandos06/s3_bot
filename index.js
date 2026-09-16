@@ -9,19 +9,15 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const { pipeline } = require('stream/promises');
-const { Transform } = require('stream');
 
 const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
-const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2 GB (servidor local Bot API)
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
-// Apuntamos al servidor local de la Bot API (docker-compose)
-const bot = new Bot(BOT_TOKEN, {
-    client: { apiRoot: "http://tg-bot-api:8081" },
-});
+const bot = new Bot(BOT_TOKEN);
 
 // ---------- Utilidades ----------
 function formatSize(b) {
@@ -98,24 +94,12 @@ function pump() {
     }
 }
 
-// ---------- Subida a S3 con progreso ----------
-async function subirAS3(tempPath, filename, size, onProgress) {
+// ---------- Subida a S3 ----------
+async function subirAS3(tempPath, filename, size) {
     const remote = `${crypto.randomBytes(4).toString('hex')}_${filename}`;
     const uploadUrl = `${S3}/${remote}`;
 
-    let uploaded = 0;
-    const progressStream = new Transform({
-        transform(chunk, _enc, cb) {
-            uploaded += chunk.length;
-            if (onProgress) onProgress(uploaded, size);
-            cb(null, chunk);
-        },
-    });
-
-    const readStream = fs.createReadStream(tempPath);
-    readStream.pipe(progressStream);
-
-    await client.put(uploadUrl, progressStream, {
+    await client.put(uploadUrl, fs.createReadStream(tempPath), {
         headers: {
             'Content-Length': size,
             'Content-Type': 'application/octet-stream',
@@ -177,21 +161,91 @@ async function descargarYSubir(ctx, url, statusMsg) {
 
             const { size } = await fsp.stat(tempPath);
 
-            queueEdit(ctx.api, chatId, msgId, "┎ UPLOADING\n┖ Preparando...", 0);
+            queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
             await new Promise(r => setTimeout(r, 60));
 
-            let lastUpPct = -1;
-            const uploadUrl = await subirAS3(tempPath, filename, size, (sent, total) => {
+            const uploadUrl = await subirAS3(tempPath, filename, size);
+
+            const name = path.basename(filename, ext).replace(/_/g, ' ');
+            await ctx.api
+                .editMessageText(
+                    chatId,
+                    msgId,
+                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`
+                )
+                .catch(() => {});
+        } catch (e) {
+            await ctx.api
+                .editMessageText(
+                    ctx.chat.id,
+                    statusMsg.message_id,
+                    `ERROR: ${(e.message || '').slice(0, 200)}`
+                )
+                .catch(() => {});
+        } finally {
+            if (stream && typeof stream.destroy === 'function') {
+                try { stream.destroy(); } catch {}
+            }
+            fsp.unlink(tempPath).catch(() => {});
+        }
+    });
+}
+
+// ---------- Procesar archivo recibido (document/video/audio/voice/etc.) ----------
+async function procesarArchivo(ctx, file, originalName, statusMsg) {
+    return enqueue(async () => {
+        const chatId = ctx.chat.id;
+        const msgId = statusMsg.message_id;
+
+        const filename = originalName || `file_${Date.now()}`;
+        const ext = path.extname(filename) || '.bin';
+        const tempPath = path.join(
+            DOWNLOAD_PATH,
+            `${crypto.randomBytes(8).toString('hex')}${ext}`
+        );
+
+        let stream = null;
+
+        try {
+            const fileInfo = await ctx.api.getFile(file.file_id);
+            const filePath = fileInfo.file_path;
+            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+            const res = await client.get(fileUrl, {
+                responseType: 'stream',
+                timeout: 0,
+            });
+            stream = res.data;
+
+            const total = Number(res.headers['content-length']) || file.file_size || 0;
+            let downloaded = 0;
+            let lastPct = -1;
+
+            stream.on('data', chunk => {
+                downloaded += chunk.length;
                 if (!total) return;
-                const pct = (sent / total) * 100 | 0;
-                if (pct - lastUpPct >= 5 || pct === 100) {
-                    lastUpPct = pct;
+                const pct = (downloaded / total) * 100 | 0;
+                if (pct - lastPct >= 5 || pct === 100) {
+                    lastPct = pct;
                     queueEdit(
                         ctx.api, chatId, msgId,
-                        `┎ UPLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(sent)}/${formatSize(total)}`
+                        `┎ DOWNLOADING FROM TELEGRAM\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`
                     );
                 }
             });
+
+            stream.on('error', err => {
+                console.error('telegram download stream error:', err.message);
+            });
+
+            await pipeline(stream, fs.createWriteStream(tempPath));
+
+            const { size } = await fsp.stat(tempPath);
+
+            queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
+            await new Promise(r => setTimeout(r, 60));
+
+            const uploadUrl = await subirAS3(tempPath, filename, size);
 
             const name = path.basename(filename, ext).replace(/_/g, ' ');
             await ctx.api
@@ -218,117 +272,107 @@ async function descargarYSubir(ctx, url, statusMsg) {
     });
 }
 
-// ---------- Procesar archivo recibido (vía servidor local Bot API) ----------
-async function procesarArchivo(ctx, file, originalName, statusMsg) {
-    return enqueue(async () => {
-        const chatId = ctx.chat.id;
-        const msgId = statusMsg.message_id;
-
-        const filename = originalName || `file_${Date.now()}`;
-        const ext = path.extname(filename) || '.bin';
-        const tempPath = path.join(
-            DOWNLOAD_PATH,
-            `${crypto.randomBytes(8).toString('hex')}${ext}`
-        );
-
-        try {
-            const fileInfo = await ctx.api.getFile(file.file_id);
-            // En modo local, file_path es una ruta absoluta dentro del contenedor
-            const localFilePath = fileInfo.file_path;
-
-            const { size } = await fsp.stat(localFilePath);
-
-            // Copia local instantánea (mismo volumen compartido)
-            await fsp.copyFile(localFilePath, tempPath);
-
-            queueEdit(ctx.api, chatId, msgId, "┎ UPLOADING\n┖ Preparando...", 0);
-            await new Promise(r => setTimeout(r, 60));
-
-            let lastUpPct = -1;
-            const uploadUrl = await subirAS3(tempPath, filename, size, (sent, total) => {
-                if (!total) return;
-                const pct = (sent / total) * 100 | 0;
-                if (pct - lastUpPct >= 5 || pct === 100) {
-                    lastUpPct = pct;
-                    queueEdit(
-                        ctx.api, chatId, msgId,
-                        `┎ UPLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(sent)}/${formatSize(total)}`
-                    );
-                }
-            });
-
-            const name = path.basename(filename, ext).replace(/_/g, ' ');
-            await ctx.api
-                .editMessageText(
-                    chatId,
-                    msgId,
-                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`
-                )
-                .catch(() => {});
-        } catch (e) {
-            await ctx.api
-                .editMessageText(
-                    chatId,
-                    msgId,
-                    `ERROR: ${(e.message || '').slice(0, 200)}`
-                )
-                .catch(() => {});
-        } finally {
-            fsp.unlink(tempPath).catch(() => {});
-        }
-    });
-}
-
 // ---------- Extraer archivo del mensaje ----------
 function extraerArchivo(msg) {
-    if (msg.document) return { file: msg.document, name: msg.document.file_name || `doc_${Date.now()}.bin` };
-    if (msg.video) return { file: msg.video, name: msg.video.file_name || `video_${Date.now()}.mp4` };
-    if (msg.audio) return { file: msg.audio, name: msg.audio.file_name || `audio_${Date.now()}.mp3` };
-    if (msg.voice) return { file: msg.voice, name: `voice_${Date.now()}.ogg` };
-    if (msg.video_note) return { file: msg.video_note, name: `video_note_${Date.now()}.mp4` };
-    if (msg.animation) return { file: msg.animation, name: msg.animation.file_name || `animation_${Date.now()}.mp4` };
-    if (msg.sticker) return { file: msg.sticker, name: `sticker_${Date.now()}.webp` };
+    if (msg.document) {
+        return {
+            file: msg.document,
+            name: msg.document.file_name || `doc_${Date.now()}.bin`,
+        };
+    }
+    if (msg.video) {
+        return {
+            file: msg.video,
+            name: msg.video.file_name || `video_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.audio) {
+        return {
+            file: msg.audio,
+            name: msg.audio.file_name || `audio_${Date.now()}.mp3`,
+        };
+    }
+    if (msg.voice) {
+        return {
+            file: msg.voice,
+            name: `voice_${Date.now()}.ogg`,
+        };
+    }
+    if (msg.video_note) {
+        return {
+            file: msg.video_note,
+            name: `video_note_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.animation) {
+        return {
+            file: msg.animation,
+            name: msg.animation.file_name || `animation_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.sticker) {
+        return {
+            file: msg.sticker,
+            name: `sticker_${Date.now()}.webp`,
+        };
+    }
+    // Fotos: tomar la de mayor resolución
     if (msg.photo && msg.photo.length) {
         const largest = msg.photo[msg.photo.length - 1];
-        return { file: largest, name: `photo_${Date.now()}.jpg` };
+        return {
+            file: largest,
+            name: `photo_${Date.now()}.jpg`,
+        };
     }
     return null;
 }
 
 // ---------- Handlers ----------
 bot.command('start', ctx =>
-    ctx.reply("Envíame un enlace de descarga directa o un archivo (hasta 2 GB).")
+    ctx.reply(
+        "Envíame un enlace de descarga directa o un archivo (menor a 50 MB)."
+    )
 );
 
 const URL_RE = /(https?:\/\/[^\s<>"']+?)(?=[.,;:!?)\]]?(\s|$))/i;
 
+// Texto con URL
 bot.on('message:text', async ctx => {
     const m = ctx.message.text.trim().match(URL_RE);
     if (!m) {
+        // Si no hay URL, avisamos al usuario
         try {
-            await ctx.reply("Envíame un enlace de descarga directa o un archivo (hasta 2 GB).");
+            await ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).");
         } catch {}
         return;
     }
     let statusMsg;
     try {
         statusMsg = await ctx.reply("PROCESSING...");
-    } catch { return; }
+    } catch {
+        return;
+    }
     descargarYSubir(ctx, m[1], statusMsg).catch(err => {
         console.error('job error:', err?.message || err);
     });
 });
 
+// Archivos (document, video, audio, voice, video_note, animation, sticker, photo)
 bot.on(
     ['message:document', 'message:video', 'message:audio', 'message:voice',
      'message:video_note', 'message:animation', 'message:sticker', 'message:photo'],
     async ctx => {
-        const info = extraerArchivo(ctx.message);
+        const msg = ctx.message;
+        const info = extraerArchivo(msg);
+
         if (!info) return;
 
         const { file, name } = info;
         const fileSize = file.file_size || 0;
 
+        // Telegram permite hasta 20 MB para bots (getFile). En la práctica
+        // el límite del bot para descargar vía getFile es 20 MB, pero
+        // validamos 50 MB como pediste por si acaso.
         if (fileSize && fileSize > MAX_FILE_SIZE) {
             try {
                 await ctx.reply(
@@ -341,7 +385,9 @@ bot.on(
         let statusMsg;
         try {
             statusMsg = await ctx.reply("PROCESSING...");
-        } catch { return; }
+        } catch {
+            return;
+        }
 
         procesarArchivo(ctx, file, name, statusMsg).catch(err => {
             console.error('file job error:', err?.message || err);
