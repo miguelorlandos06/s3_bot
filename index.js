@@ -13,14 +13,13 @@ const { pipeline } = require('stream/promises');
 const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
-const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2 GB (servidor Bot API local)
-const TG_API_ROOT = "https://tg-api-hrlr.onrender.com";
+const MAX_FILE_SIZE = 2000 * 1024 * 1024; // 2 GB
 const SELF_URL = "https://s3-bot-cgww.onrender.com";
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
 const bot = new Bot(BOT_TOKEN, {
-    client: { apiRoot: TG_API_ROOT },
+    client: { apiRoot: "http://localhost:8081" },
 });
 
 // ---------- Utilidades ----------
@@ -195,7 +194,7 @@ async function descargarYSubir(ctx, url, statusMsg) {
     });
 }
 
-// ---------- Procesar archivo recibido (vía servidor local Bot API) ----------
+// ---------- Procesar archivo recibido (lee desde disco, Bot API local) ----------
 async function procesarArchivo(ctx, file, originalName, statusMsg) {
     return enqueue(async () => {
         const chatId = ctx.chat.id;
@@ -208,43 +207,13 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
             `${crypto.randomBytes(8).toString('hex')}${ext}`
         );
 
-        let stream = null;
-
         try {
             const fileInfo = await ctx.api.getFile(file.file_id);
-            const filePath = fileInfo.file_path;
-            const fileUrl = `${TG_API_ROOT}/file/bot${BOT_TOKEN}/${filePath}`;
+            const localFilePath = fileInfo.file_path; // ruta absoluta en disco
 
-            const res = await client.get(fileUrl, {
-                responseType: 'stream',
-                timeout: 0,
-            });
-            stream = res.data;
+            const { size } = await fsp.stat(localFilePath);
 
-            const total = Number(res.headers['content-length']) || file.file_size || 0;
-            let downloaded = 0;
-            let lastPct = -1;
-
-            stream.on('data', chunk => {
-                downloaded += chunk.length;
-                if (!total) return;
-                const pct = (downloaded / total) * 100 | 0;
-                if (pct - lastPct >= 5 || pct === 100) {
-                    lastPct = pct;
-                    queueEdit(
-                        ctx.api, chatId, msgId,
-                        `┎ DOWNLOADING FROM TELEGRAM\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`
-                    );
-                }
-            });
-
-            stream.on('error', err => {
-                console.error('telegram download stream error:', err.message);
-            });
-
-            await pipeline(stream, fs.createWriteStream(tempPath));
-
-            const { size } = await fsp.stat(tempPath);
+            await fsp.copyFile(localFilePath, tempPath);
 
             queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
             await new Promise(r => setTimeout(r, 60));
@@ -268,9 +237,6 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
                 )
                 .catch(() => {});
         } finally {
-            if (stream && typeof stream.destroy === 'function') {
-                try { stream.destroy(); } catch {}
-            }
             fsp.unlink(tempPath).catch(() => {});
         }
     });
@@ -278,63 +244,23 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
 
 // ---------- Extraer archivo del mensaje ----------
 function extraerArchivo(msg) {
-    if (msg.document) {
-        return {
-            file: msg.document,
-            name: msg.document.file_name || `doc_${Date.now()}.bin`,
-        };
-    }
-    if (msg.video) {
-        return {
-            file: msg.video,
-            name: msg.video.file_name || `video_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.audio) {
-        return {
-            file: msg.audio,
-            name: msg.audio.file_name || `audio_${Date.now()}.mp3`,
-        };
-    }
-    if (msg.voice) {
-        return {
-            file: msg.voice,
-            name: `voice_${Date.now()}.ogg`,
-        };
-    }
-    if (msg.video_note) {
-        return {
-            file: msg.video_note,
-            name: `video_note_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.animation) {
-        return {
-            file: msg.animation,
-            name: msg.animation.file_name || `animation_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.sticker) {
-        return {
-            file: msg.sticker,
-            name: `sticker_${Date.now()}.webp`,
-        };
-    }
+    if (msg.document) return { file: msg.document, name: msg.document.file_name || `doc_${Date.now()}.bin` };
+    if (msg.video) return { file: msg.video, name: msg.video.file_name || `video_${Date.now()}.mp4` };
+    if (msg.audio) return { file: msg.audio, name: msg.audio.file_name || `audio_${Date.now()}.mp3` };
+    if (msg.voice) return { file: msg.voice, name: `voice_${Date.now()}.ogg` };
+    if (msg.video_note) return { file: msg.video_note, name: `video_note_${Date.now()}.mp4` };
+    if (msg.animation) return { file: msg.animation, name: msg.animation.file_name || `animation_${Date.now()}.mp4` };
+    if (msg.sticker) return { file: msg.sticker, name: `sticker_${Date.now()}.webp` };
     if (msg.photo && msg.photo.length) {
         const largest = msg.photo[msg.photo.length - 1];
-        return {
-            file: largest,
-            name: `photo_${Date.now()}.jpg`,
-        };
+        return { file: largest, name: `photo_${Date.now()}.jpg` };
     }
     return null;
 }
 
 // ---------- Handlers ----------
 bot.command('start', ctx =>
-    ctx.reply(
-        "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
-    )
+    ctx.reply("Envíame un enlace de descarga directa o un archivo (hasta 2 GB).")
 );
 
 const URL_RE = /(https?:\/\/[^\s<>"']+?)(?=[.,;:!?)\]]?(\s|$))/i;
@@ -350,9 +276,7 @@ bot.on('message:text', async ctx => {
     let statusMsg;
     try {
         statusMsg = await ctx.reply("PROCESSING...");
-    } catch {
-        return;
-    }
+    } catch { return; }
     descargarYSubir(ctx, m[1], statusMsg).catch(err => {
         console.error('job error:', err?.message || err);
     });
@@ -362,9 +286,7 @@ bot.on(
     ['message:document', 'message:video', 'message:audio', 'message:voice',
      'message:video_note', 'message:animation', 'message:sticker', 'message:photo'],
     async ctx => {
-        const msg = ctx.message;
-        const info = extraerArchivo(msg);
-
+        const info = extraerArchivo(ctx.message);
         if (!info) return;
 
         const { file, name } = info;
@@ -382,9 +304,7 @@ bot.on(
         let statusMsg;
         try {
             statusMsg = await ctx.reply("PROCESSING...");
-        } catch {
-            return;
-        }
+        } catch { return; }
 
         procesarArchivo(ctx, file, name, statusMsg).catch(err => {
             console.error('file job error:', err?.message || err);
@@ -400,16 +320,9 @@ app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
 const PORT = process.env.PORT || 10000;
 app.listen(PORT, () => console.log(`Web on ${PORT}`));
 
-// Auto-ping #1: mantiene despierto ESTE servicio (el bot)
 setInterval(
     () => client.get(`${SELF_URL}/health`).catch(() => {}),
     10 * 60 * 1000
-);
-
-// Auto-ping #2: mantiene despierto el Bot API local
-setInterval(
-    () => client.get(`${TG_API_ROOT}/bot${BOT_TOKEN}/getMe`).catch(() => {}),
-    5 * 60 * 1000
 );
 
 // ---------- Arranque ----------
