@@ -177,8 +177,8 @@ async function descargarYSubir(ctx, url, statusMsg) {
         } catch (e) {
             await ctx.api
                 .editMessageText(
-                    ctx.chat.id,
-                    statusMsg.message_id,
+                    chatId,
+                    msgId,
                     `ERROR: ${(e.message || '').slice(0, 200)}`
                 )
                 .catch(() => {});
@@ -191,7 +191,7 @@ async function descargarYSubir(ctx, url, statusMsg) {
     });
 }
 
-// ---------- Procesar archivo recibido (document/video/audio/voice/etc.) ----------
+// ---------- Procesar archivo recibido ----------
 async function procesarArchivo(ctx, file, originalName, statusMsg) {
     return enqueue(async () => {
         const chatId = ctx.chat.id;
@@ -316,7 +316,6 @@ function extraerArchivo(msg) {
             name: `sticker_${Date.now()}.webp`,
         };
     }
-    // Fotos: tomar la de mayor resolución
     if (msg.photo && msg.photo.length) {
         const largest = msg.photo[msg.photo.length - 1];
         return {
@@ -336,11 +335,9 @@ bot.command('start', ctx =>
 
 const URL_RE = /(https?:\/\/[^\s<>"']+?)(?=[.,;:!?)\]]?(\s|$))/i;
 
-// Texto con URL
 bot.on('message:text', async ctx => {
     const m = ctx.message.text.trim().match(URL_RE);
     if (!m) {
-        // Si no hay URL, avisamos al usuario
         try {
             await ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).");
         } catch {}
@@ -357,7 +354,6 @@ bot.on('message:text', async ctx => {
     });
 });
 
-// Archivos (document, video, audio, voice, video_note, animation, sticker, photo)
 bot.on(
     ['message:document', 'message:video', 'message:audio', 'message:voice',
      'message:video_note', 'message:animation', 'message:sticker', 'message:photo'],
@@ -370,9 +366,6 @@ bot.on(
         const { file, name } = info;
         const fileSize = file.file_size || 0;
 
-        // Telegram permite hasta 20 MB para bots (getFile). En la práctica
-        // el límite del bot para descargar vía getFile es 20 MB, pero
-        // validamos 50 MB como pediste por si acaso.
         if (fileSize && fileSize > MAX_FILE_SIZE) {
             try {
                 await ctx.reply(
@@ -399,7 +392,9 @@ bot.on(
 const app = express();
 app.get('/', (_q, r) => r.json({ status: 'online' }));
 app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
-app.listen(10000, () => console.log('Web on 10000'));
+
+const PORT = process.env.PORT || 10000;
+app.listen(PORT, () => console.log(`Web on ${PORT}`));
 
 setInterval(
     () => client.get('https://s3-bot-pjpo.onrender.com/health').catch(() => {}),
