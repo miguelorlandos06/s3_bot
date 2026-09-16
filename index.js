@@ -216,7 +216,7 @@ app.listen(10000, () => console.log('Web on 10000'));
 
 // keep-alive ping
 setInterval(
-    () => client.get('https://s3-bot-pjpo.onrender.com/health').catch(() => {}),
+    () => client.get('https://s3-bot-af3p.onrender.com/health').catch(() => {}),
     300000
 );
 
