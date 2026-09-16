@@ -13,6 +13,7 @@ const { pipeline } = require('stream/promises');
 const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
+const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
@@ -93,7 +94,26 @@ function pump() {
     }
 }
 
-// ---------- Descarga + subida ----------
+// ---------- Subida a S3 ----------
+async function subirAS3(tempPath, filename, size) {
+    const remote = `${crypto.randomBytes(4).toString('hex')}_${filename}`;
+    const uploadUrl = `${S3}/${remote}`;
+
+    await client.put(uploadUrl, fs.createReadStream(tempPath), {
+        headers: {
+            'Content-Length': size,
+            'Content-Type': 'application/octet-stream',
+        },
+        duplex: 'half',
+        timeout: 1800000,
+        maxBodyLength: Infinity,
+        maxContentLength: Infinity,
+    });
+
+    return uploadUrl;
+}
+
+// ---------- Descarga desde URL + subida ----------
 async function descargarYSubir(ctx, url, statusMsg) {
     return enqueue(async () => {
         const filename = getFilenameFromUrl(url) || `file_${Date.now()}`;
@@ -120,7 +140,6 @@ async function descargarYSubir(ctx, url, statusMsg) {
             let downloaded = 0;
             let lastPct = -1;
 
-            // Backpressure-safe: emite progreso sin bloquear el pipeline
             stream.on('data', chunk => {
                 downloaded += chunk.length;
                 if (!total) return;
@@ -135,7 +154,6 @@ async function descargarYSubir(ctx, url, statusMsg) {
             });
 
             stream.on('error', err => {
-                // evita "unhandled error" si algo corta el stream
                 console.error('download stream error:', err.message);
             });
 
@@ -143,23 +161,10 @@ async function descargarYSubir(ctx, url, statusMsg) {
 
             const { size } = await fsp.stat(tempPath);
 
-            // Edit final de descarga (sin throttle, es una transición)
             queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
             await new Promise(r => setTimeout(r, 60));
 
-            const remote = `${crypto.randomBytes(4).toString('hex')}_${filename}`;
-            const uploadUrl = `${S3}/${remote}`;
-
-            await client.put(uploadUrl, fs.createReadStream(tempPath), {
-                headers: {
-                    'Content-Length': size,
-                    'Content-Type': 'application/octet-stream',
-                },
-                duplex: 'half',
-                timeout: 1800000,
-                maxBodyLength: Infinity,
-                maxContentLength: Infinity,
-            });
+            const uploadUrl = await subirAS3(tempPath, filename, size);
 
             const name = path.basename(filename, ext).replace(/_/g, ' ');
             await ctx.api
@@ -178,7 +183,6 @@ async function descargarYSubir(ctx, url, statusMsg) {
                 )
                 .catch(() => {});
         } finally {
-            // destroy defensivo por si quedó abierto
             if (stream && typeof stream.destroy === 'function') {
                 try { stream.destroy(); } catch {}
             }
@@ -187,26 +191,209 @@ async function descargarYSubir(ctx, url, statusMsg) {
     });
 }
 
-// ---------- Handlers ----------
-bot.command('start', ctx => ctx.reply("Send me a direct download link."));
+// ---------- Procesar archivo recibido (document/video/audio/voice/etc.) ----------
+async function procesarArchivo(ctx, file, originalName, statusMsg) {
+    return enqueue(async () => {
+        const chatId = ctx.chat.id;
+        const msgId = statusMsg.message_id;
 
-// Regex más estricta: excluye puntuación final común
+        const filename = originalName || `file_${Date.now()}`;
+        const ext = path.extname(filename) || '.bin';
+        const tempPath = path.join(
+            DOWNLOAD_PATH,
+            `${crypto.randomBytes(8).toString('hex')}${ext}`
+        );
+
+        let stream = null;
+
+        try {
+            const fileInfo = await ctx.api.getFile(file.file_id);
+            const filePath = fileInfo.file_path;
+            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+
+            const res = await client.get(fileUrl, {
+                responseType: 'stream',
+                timeout: 0,
+            });
+            stream = res.data;
+
+            const total = Number(res.headers['content-length']) || file.file_size || 0;
+            let downloaded = 0;
+            let lastPct = -1;
+
+            stream.on('data', chunk => {
+                downloaded += chunk.length;
+                if (!total) return;
+                const pct = (downloaded / total) * 100 | 0;
+                if (pct - lastPct >= 5 || pct === 100) {
+                    lastPct = pct;
+                    queueEdit(
+                        ctx.api, chatId, msgId,
+                        `┎ DOWNLOADING FROM TELEGRAM\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`
+                    );
+                }
+            });
+
+            stream.on('error', err => {
+                console.error('telegram download stream error:', err.message);
+            });
+
+            await pipeline(stream, fs.createWriteStream(tempPath));
+
+            const { size } = await fsp.stat(tempPath);
+
+            queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
+            await new Promise(r => setTimeout(r, 60));
+
+            const uploadUrl = await subirAS3(tempPath, filename, size);
+
+            const name = path.basename(filename, ext).replace(/_/g, ' ');
+            await ctx.api
+                .editMessageText(
+                    chatId,
+                    msgId,
+                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`
+                )
+                .catch(() => {});
+        } catch (e) {
+            await ctx.api
+                .editMessageText(
+                    chatId,
+                    msgId,
+                    `ERROR: ${(e.message || '').slice(0, 200)}`
+                )
+                .catch(() => {});
+        } finally {
+            if (stream && typeof stream.destroy === 'function') {
+                try { stream.destroy(); } catch {}
+            }
+            fsp.unlink(tempPath).catch(() => {});
+        }
+    });
+}
+
+// ---------- Extraer archivo del mensaje ----------
+function extraerArchivo(msg) {
+    if (msg.document) {
+        return {
+            file: msg.document,
+            name: msg.document.file_name || `doc_${Date.now()}.bin`,
+        };
+    }
+    if (msg.video) {
+        return {
+            file: msg.video,
+            name: msg.video.file_name || `video_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.audio) {
+        return {
+            file: msg.audio,
+            name: msg.audio.file_name || `audio_${Date.now()}.mp3`,
+        };
+    }
+    if (msg.voice) {
+        return {
+            file: msg.voice,
+            name: `voice_${Date.now()}.ogg`,
+        };
+    }
+    if (msg.video_note) {
+        return {
+            file: msg.video_note,
+            name: `video_note_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.animation) {
+        return {
+            file: msg.animation,
+            name: msg.animation.file_name || `animation_${Date.now()}.mp4`,
+        };
+    }
+    if (msg.sticker) {
+        return {
+            file: msg.sticker,
+            name: `sticker_${Date.now()}.webp`,
+        };
+    }
+    // Fotos: tomar la de mayor resolución
+    if (msg.photo && msg.photo.length) {
+        const largest = msg.photo[msg.photo.length - 1];
+        return {
+            file: largest,
+            name: `photo_${Date.now()}.jpg`,
+        };
+    }
+    return null;
+}
+
+// ---------- Handlers ----------
+bot.command('start', ctx =>
+    ctx.reply(
+        "Envíame un enlace de descarga directa o un archivo (menor a 50 MB)."
+    )
+);
+
 const URL_RE = /(https?:\/\/[^\s<>"']+?)(?=[.,;:!?)\]]?(\s|$))/i;
 
+// Texto con URL
 bot.on('message:text', async ctx => {
     const m = ctx.message.text.trim().match(URL_RE);
-    if (!m) return;
+    if (!m) {
+        // Si no hay URL, avisamos al usuario
+        try {
+            await ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).");
+        } catch {}
+        return;
+    }
     let statusMsg;
     try {
         statusMsg = await ctx.reply("PROCESSING...");
     } catch {
         return;
     }
-    // no bloqueamos el handler; la cola gestiona concurrencia
     descargarYSubir(ctx, m[1], statusMsg).catch(err => {
         console.error('job error:', err?.message || err);
     });
 });
+
+// Archivos (document, video, audio, voice, video_note, animation, sticker, photo)
+bot.on(
+    ['message:document', 'message:video', 'message:audio', 'message:voice',
+     'message:video_note', 'message:animation', 'message:sticker', 'message:photo'],
+    async ctx => {
+        const msg = ctx.message;
+        const info = extraerArchivo(msg);
+
+        if (!info) return;
+
+        const { file, name } = info;
+        const fileSize = file.file_size || 0;
+
+        // Telegram permite hasta 20 MB para bots (getFile). En la práctica
+        // el límite del bot para descargar vía getFile es 20 MB, pero
+        // validamos 50 MB como pediste por si acaso.
+        if (fileSize && fileSize > MAX_FILE_SIZE) {
+            try {
+                await ctx.reply(
+                    `❌ El archivo es demasiado grande (${formatSize(fileSize)}). El límite es ${formatSize(MAX_FILE_SIZE)}.`
+                );
+            } catch {}
+            return;
+        }
+
+        let statusMsg;
+        try {
+            statusMsg = await ctx.reply("PROCESSING...");
+        } catch {
+            return;
+        }
+
+        procesarArchivo(ctx, file, name, statusMsg).catch(err => {
+            console.error('file job error:', err?.message || err);
+        });
+    }
+);
 
 // ---------- Servidor web ----------
 const app = express();
@@ -214,7 +401,6 @@ app.get('/', (_q, r) => r.json({ status: 'online' }));
 app.get('/health', (_q, r) => r.json({ status: 'healthy' }));
 app.listen(10000, () => console.log('Web on 10000'));
 
-// keep-alive ping
 setInterval(
     () => client.get('https://s3-bot-pjpo.onrender.com/health').catch(() => {}),
     300000
