@@ -1,5 +1,5 @@
 // index.js
-const { Bot } = require('grammy');
+const { Bot, InlineKeyboard } = require('grammy');
 const axios = require('axios');
 const express = require('express');
 const fs = require('fs-extra');
@@ -9,15 +9,54 @@ const crypto = require('crypto');
 const http = require('http');
 const https = require('https');
 const { pipeline } = require('stream/promises');
+const { Transform } = require('stream');
 
 const BOT_TOKEN = "8611512607:AAFYiZUGWn6r8Ehp9YWCHFUG2hZ2hA01CDw";
 const S3 = "https://s3.todus.cu/stream";
 const DOWNLOAD_PATH = "/tmp/todus_uploads";
-const MAX_FILE_SIZE = 50 * 1024 * 1024; // 50 MB
+const MAX_FILE_SIZE = 50 * 1024 * 1024;
 
 fs.ensureDirSync(DOWNLOAD_PATH);
 
 const bot = new Bot(BOT_TOKEN);
+
+// ---------- Registro de trabajos cancelables ----------
+// jobId -> { cancelled, abort, streams:Set, tempPath }
+const jobs = new Map();
+
+function crearJob() {
+    const jobId = crypto.randomBytes(6).toString('hex');
+    const job = {
+        cancelled: false,
+        abort: new AbortController(),
+        streams: new Set(),
+        tempPath: null,
+    };
+    jobs.set(jobId, job);
+    return { jobId, job };
+}
+
+function finalizarJob(jobId) {
+    const job = jobs.get(jobId);
+    if (!job) return;
+    try { job.abort.abort(); } catch {}
+    for (const s of job.streams) {
+        try { s.destroy(); } catch {}
+    }
+    job.streams.clear();
+    jobs.delete(jobId);
+}
+
+function cancelarJob(jobId) {
+    const job = jobs.get(jobId);
+    if (!job) return false;
+    job.cancelled = true;
+    try { job.abort.abort(); } catch {}
+    for (const s of job.streams) {
+        try { s.destroy(new Error('cancelled')); } catch {}
+    }
+    return true;
+}
 
 // ---------- Utilidades ----------
 function formatSize(b) {
@@ -39,13 +78,13 @@ function getFilenameFromUrl(url) {
 
 // ---------- Cola de edits con throttle por chat ----------
 const editState = new Map();
-function queueEdit(api, chatId, msgId, text, minInterval = 1200) {
+function queueEdit(api, chatId, msgId, text, keyboard = null, minInterval = 1200) {
     let s = editState.get(chatId);
     if (!s) {
         s = { pending: null, lastSent: 0, timer: null };
         editState.set(chatId, s);
     }
-    s.pending = { msgId, text };
+    s.pending = { msgId, text, keyboard };
 
     const now = Date.now();
     const elapsed = now - s.lastSent;
@@ -55,7 +94,11 @@ function queueEdit(api, chatId, msgId, text, minInterval = 1200) {
         s.pending = null;
         if (!p) return;
         s.lastSent = Date.now();
-        api.editMessageText(chatId, p.msgId, p.text).catch(() => {});
+        api
+            .editMessageText(chatId, p.msgId, p.text, {
+                reply_markup: p.keyboard || undefined,
+            })
+            .catch(() => {});
     };
 
     if (elapsed >= minInterval) {
@@ -94,12 +137,31 @@ function pump() {
     }
 }
 
-// ---------- Subida a S3 ----------
-async function subirAS3(tempPath, filename, size) {
+// ---------- Subida a S3 con progreso y cancelación ----------
+async function subirAS3(tempPath, filename, size, job, onProgress) {
     const remote = `${crypto.randomBytes(4).toString('hex')}_${filename}`;
     const uploadUrl = `${S3}/${remote}`;
 
-    await client.put(uploadUrl, fs.createReadStream(tempPath), {
+    let uploaded = 0;
+    const progressStream = new Transform({
+        transform(chunk, _enc, cb) {
+            if (job.cancelled) return cb(new Error('cancelled'));
+            uploaded += chunk.length;
+            if (onProgress) onProgress(uploaded, size);
+            cb(null, chunk);
+        },
+    });
+
+    const readStream = fs.createReadStream(tempPath);
+    job.streams.add(readStream);
+    job.streams.add(progressStream);
+
+    readStream.on('close', () => job.streams.delete(readStream));
+    progressStream.on('close', () => job.streams.delete(progressStream));
+
+    readStream.pipe(progressStream);
+
+    await client.put(uploadUrl, progressStream, {
         headers: {
             'Content-Length': size,
             'Content-Type': 'application/octet-stream',
@@ -108,6 +170,7 @@ async function subirAS3(tempPath, filename, size) {
         timeout: 1800000,
         maxBodyLength: Infinity,
         maxContentLength: Infinity,
+        signal: job.abort.signal,
     });
 
     return uploadUrl;
@@ -115,6 +178,12 @@ async function subirAS3(tempPath, filename, size) {
 
 // ---------- Descarga desde URL + subida ----------
 async function descargarYSubir(ctx, url, statusMsg) {
+    const { jobId, job } = crearJob();
+    const cancelKb = new InlineKeyboard().text('❌ Cancelar', `cancel:${jobId}`);
+
+    // Guardamos referencia para usarla en edits
+    const kb = cancelKb;
+
     return enqueue(async () => {
         const filename = getFilenameFromUrl(url) || `file_${Date.now()}`;
         const ext = path.extname(filename) || '.bin';
@@ -122,6 +191,7 @@ async function descargarYSubir(ctx, url, statusMsg) {
             DOWNLOAD_PATH,
             `${crypto.randomBytes(8).toString('hex')}${ext}`
         );
+        job.tempPath = tempPath;
 
         const chatId = ctx.chat.id;
         const msgId = statusMsg.message_id;
@@ -133,14 +203,18 @@ async function descargarYSubir(ctx, url, statusMsg) {
                 maxRedirects: 10,
                 headers: { 'User-Agent': 'Mozilla/5.0' },
                 validateStatus: s => s >= 200 && s < 400,
+                signal: job.abort.signal,
             });
             stream = res.data;
+            job.streams.add(stream);
+            stream.on('close', () => job.streams.delete(stream));
 
             const total = Number(res.headers['content-length']) || 0;
             let downloaded = 0;
             let lastPct = -1;
 
             stream.on('data', chunk => {
+                if (job.cancelled) return;
                 downloaded += chunk.length;
                 if (!total) return;
                 const pct = (downloaded / total) * 100 | 0;
@@ -148,7 +222,8 @@ async function descargarYSubir(ctx, url, statusMsg) {
                     lastPct = pct;
                     queueEdit(
                         ctx.api, chatId, msgId,
-                        `┎ DOWNLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`
+                        `┎ DOWNLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`,
+                        kb
                     );
                 }
             });
@@ -159,27 +234,48 @@ async function descargarYSubir(ctx, url, statusMsg) {
 
             await pipeline(stream, fs.createWriteStream(tempPath));
 
+            if (job.cancelled) throw new Error('cancelled');
+
             const { size } = await fsp.stat(tempPath);
 
-            queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
+            queueEdit(ctx.api, chatId, msgId, "┎ UPLOADING\n┖ Preparando...", kb, 0);
             await new Promise(r => setTimeout(r, 60));
 
-            const uploadUrl = await subirAS3(tempPath, filename, size);
+            let lastUpPct = -1;
+            const uploadUrl = await subirAS3(tempPath, filename, size, job, (sent, total) => {
+                if (!total) return;
+                const pct = (sent / total) * 100 | 0;
+                if (pct - lastUpPct >= 5 || pct === 100) {
+                    lastUpPct = pct;
+                    queueEdit(
+                        ctx.api, chatId, msgId,
+                        `┎ UPLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(sent)}/${formatSize(total)}`,
+                        kb
+                    );
+                }
+            });
+
+            if (job.cancelled) throw new Error('cancelled');
 
             const name = path.basename(filename, ext).replace(/_/g, ' ');
             await ctx.api
                 .editMessageText(
                     chatId,
                     msgId,
-                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`
+                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`,
+                    { reply_markup: undefined }
                 )
                 .catch(() => {});
         } catch (e) {
+            const cancelled = job.cancelled || (e?.message === 'cancelled');
             await ctx.api
                 .editMessageText(
-                    ctx.chat.id,
-                    statusMsg.message_id,
-                    `ERROR: ${(e.message || '').slice(0, 200)}`
+                    chatId,
+                    msgId,
+                    cancelled
+                        ? "❌ CANCELADO"
+                        : `ERROR: ${(e.message || '').slice(0, 200)}`,
+                    { reply_markup: undefined }
                 )
                 .catch(() => {});
         } finally {
@@ -187,12 +283,16 @@ async function descargarYSubir(ctx, url, statusMsg) {
                 try { stream.destroy(); } catch {}
             }
             fsp.unlink(tempPath).catch(() => {});
+            finalizarJob(jobId);
         }
     });
 }
 
-// ---------- Procesar archivo recibido (document/video/audio/voice/etc.) ----------
+// ---------- Procesar archivo recibido ----------
 async function procesarArchivo(ctx, file, originalName, statusMsg) {
+    const { jobId, job } = crearJob();
+    const kb = new InlineKeyboard().text('❌ Cancelar', `cancel:${jobId}`);
+
     return enqueue(async () => {
         const chatId = ctx.chat.id;
         const msgId = statusMsg.message_id;
@@ -203,25 +303,29 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
             DOWNLOAD_PATH,
             `${crypto.randomBytes(8).toString('hex')}${ext}`
         );
+        job.tempPath = tempPath;
 
         let stream = null;
 
         try {
             const fileInfo = await ctx.api.getFile(file.file_id);
-            const filePath = fileInfo.file_path;
-            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${filePath}`;
+            const fileUrl = `https://api.telegram.org/file/bot${BOT_TOKEN}/${fileInfo.file_path}`;
 
             const res = await client.get(fileUrl, {
                 responseType: 'stream',
                 timeout: 0,
+                signal: job.abort.signal,
             });
             stream = res.data;
+            job.streams.add(stream);
+            stream.on('close', () => job.streams.delete(stream));
 
             const total = Number(res.headers['content-length']) || file.file_size || 0;
             let downloaded = 0;
             let lastPct = -1;
 
             stream.on('data', chunk => {
+                if (job.cancelled) return;
                 downloaded += chunk.length;
                 if (!total) return;
                 const pct = (downloaded / total) * 100 | 0;
@@ -229,7 +333,8 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
                     lastPct = pct;
                     queueEdit(
                         ctx.api, chatId, msgId,
-                        `┎ DOWNLOADING FROM TELEGRAM\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`
+                        `┎ DOWNLOADING FROM TELEGRAM\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(downloaded)}/${formatSize(total)}`,
+                        kb
                     );
                 }
             });
@@ -240,27 +345,48 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
 
             await pipeline(stream, fs.createWriteStream(tempPath));
 
+            if (job.cancelled) throw new Error('cancelled');
+
             const { size } = await fsp.stat(tempPath);
 
-            queueEdit(ctx.api, chatId, msgId, "UPLOADING...", 0);
+            queueEdit(ctx.api, chatId, msgId, "┎ UPLOADING\n┖ Preparando...", kb, 0);
             await new Promise(r => setTimeout(r, 60));
 
-            const uploadUrl = await subirAS3(tempPath, filename, size);
+            let lastUpPct = -1;
+            const uploadUrl = await subirAS3(tempPath, filename, size, job, (sent, total) => {
+                if (!total) return;
+                const pct = (sent / total) * 100 | 0;
+                if (pct - lastUpPct >= 5 || pct === 100) {
+                    lastUpPct = pct;
+                    queueEdit(
+                        ctx.api, chatId, msgId,
+                        `┎ UPLOADING\n┠ [${progressBar(pct)}]\n┠ PERCENTAGE: ${pct}%\n┖ SIZE: ${formatSize(sent)}/${formatSize(total)}`,
+                        kb
+                    );
+                }
+            });
+
+            if (job.cancelled) throw new Error('cancelled');
 
             const name = path.basename(filename, ext).replace(/_/g, ' ');
             await ctx.api
                 .editMessageText(
                     chatId,
                     msgId,
-                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`
+                    `┎ NAME: ${name}\n┠ EXTENSION: ${ext.replace('.', '')}\n┠ SIZE: ${formatSize(size)}\n┖ URL: ${uploadUrl}`,
+                    { reply_markup: undefined }
                 )
                 .catch(() => {});
         } catch (e) {
+            const cancelled = job.cancelled || (e?.message === 'cancelled');
             await ctx.api
                 .editMessageText(
                     chatId,
                     msgId,
-                    `ERROR: ${(e.message || '').slice(0, 200)}`
+                    cancelled
+                        ? "❌ CANCELADO"
+                        : `ERROR: ${(e.message || '').slice(0, 200)}`,
+                    { reply_markup: undefined }
                 )
                 .catch(() => {});
         } finally {
@@ -268,79 +394,53 @@ async function procesarArchivo(ctx, file, originalName, statusMsg) {
                 try { stream.destroy(); } catch {}
             }
             fsp.unlink(tempPath).catch(() => {});
+            finalizarJob(jobId);
         }
     });
 }
 
+// ---------- Handler del botón Cancelar ----------
+bot.callbackQuery(/^cancel:(.+)$/, async ctx => {
+    const jobId = ctx.match[1];
+    const ok = cancelarJob(jobId);
+
+    await ctx.answerCallbackQuery({
+        text: ok ? "Cancelando..." : "Ya no está activo",
+    }).catch(() => {});
+
+    if (ok) {
+        await ctx
+            .editMessageText("❌ CANCELADO", { reply_markup: undefined })
+            .catch(() => {});
+    }
+});
+
 // ---------- Extraer archivo del mensaje ----------
 function extraerArchivo(msg) {
-    if (msg.document) {
-        return {
-            file: msg.document,
-            name: msg.document.file_name || `doc_${Date.now()}.bin`,
-        };
-    }
-    if (msg.video) {
-        return {
-            file: msg.video,
-            name: msg.video.file_name || `video_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.audio) {
-        return {
-            file: msg.audio,
-            name: msg.audio.file_name || `audio_${Date.now()}.mp3`,
-        };
-    }
-    if (msg.voice) {
-        return {
-            file: msg.voice,
-            name: `voice_${Date.now()}.ogg`,
-        };
-    }
-    if (msg.video_note) {
-        return {
-            file: msg.video_note,
-            name: `video_note_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.animation) {
-        return {
-            file: msg.animation,
-            name: msg.animation.file_name || `animation_${Date.now()}.mp4`,
-        };
-    }
-    if (msg.sticker) {
-        return {
-            file: msg.sticker,
-            name: `sticker_${Date.now()}.webp`,
-        };
-    }
-    // Fotos: tomar la de mayor resolución
+    if (msg.document) return { file: msg.document, name: msg.document.file_name || `doc_${Date.now()}.bin` };
+    if (msg.video) return { file: msg.video, name: msg.video.file_name || `video_${Date.now()}.mp4` };
+    if (msg.audio) return { file: msg.audio, name: msg.audio.file_name || `audio_${Date.now()}.mp3` };
+    if (msg.voice) return { file: msg.voice, name: `voice_${Date.now()}.ogg` };
+    if (msg.video_note) return { file: msg.video_note, name: `video_note_${Date.now()}.mp4` };
+    if (msg.animation) return { file: msg.animation, name: msg.animation.file_name || `animation_${Date.now()}.mp4` };
+    if (msg.sticker) return { file: msg.sticker, name: `sticker_${Date.now()}.webp` };
     if (msg.photo && msg.photo.length) {
         const largest = msg.photo[msg.photo.length - 1];
-        return {
-            file: largest,
-            name: `photo_${Date.now()}.jpg`,
-        };
+        return { file: largest, name: `photo_${Date.now()}.jpg` };
     }
     return null;
 }
 
 // ---------- Handlers ----------
 bot.command('start', ctx =>
-    ctx.reply(
-        "Envíame un enlace de descarga directa o un archivo (menor a 50 MB)."
-    )
+    ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).")
 );
 
 const URL_RE = /(https?:\/\/[^\s<>"']+?)(?=[.,;:!?)\]]?(\s|$))/i;
 
-// Texto con URL
 bot.on('message:text', async ctx => {
     const m = ctx.message.text.trim().match(URL_RE);
     if (!m) {
-        // Si no hay URL, avisamos al usuario
         try {
             await ctx.reply("Envíame un enlace de descarga directa o un archivo (menor a 50 MB).");
         } catch {}
@@ -349,30 +449,22 @@ bot.on('message:text', async ctx => {
     let statusMsg;
     try {
         statusMsg = await ctx.reply("PROCESSING...");
-    } catch {
-        return;
-    }
+    } catch { return; }
     descargarYSubir(ctx, m[1], statusMsg).catch(err => {
         console.error('job error:', err?.message || err);
     });
 });
 
-// Archivos (document, video, audio, voice, video_note, animation, sticker, photo)
 bot.on(
     ['message:document', 'message:video', 'message:audio', 'message:voice',
      'message:video_note', 'message:animation', 'message:sticker', 'message:photo'],
     async ctx => {
-        const msg = ctx.message;
-        const info = extraerArchivo(msg);
-
+        const info = extraerArchivo(ctx.message);
         if (!info) return;
 
         const { file, name } = info;
         const fileSize = file.file_size || 0;
 
-        // Telegram permite hasta 20 MB para bots (getFile). En la práctica
-        // el límite del bot para descargar vía getFile es 20 MB, pero
-        // validamos 50 MB como pediste por si acaso.
         if (fileSize && fileSize > MAX_FILE_SIZE) {
             try {
                 await ctx.reply(
@@ -385,9 +477,7 @@ bot.on(
         let statusMsg;
         try {
             statusMsg = await ctx.reply("PROCESSING...");
-        } catch {
-            return;
-        }
+        } catch { return; }
 
         procesarArchivo(ctx, file, name, statusMsg).catch(err => {
             console.error('file job error:', err?.message || err);
