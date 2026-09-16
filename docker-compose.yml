@@ -1,0 +1,28 @@
+services:
+  tg-bot-api:
+    image: ragnarok22/telegram-bot-api-docker:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      TELEGRAM_API_ID: "32471788"
+      TELEGRAM_API_HASH: "cb57130abda56877acf3b3027e569450"
+      TELEGRAM_LOCAL: "1"
+    volumes:
+      - tg-data:/data
+
+  bot:
+    build: .
+    container_name: todus-bot
+    restart: unless-stopped
+    depends_on:
+      - tg-bot-api
+    volumes:
+      - tg-data:/data
+      - /tmp/todus_uploads:/tmp/todus_uploads
+    ports:
+      - "10000:10000"
+
+volumes:
+  tg-data:
