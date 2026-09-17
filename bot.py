@@ -38,6 +38,33 @@ app = Client(
     workers=8,
 )
 
+# ----------------- Registro de trabajos cancelables -----------------
+# job_id -> {"task": asyncio.Task, "temp_path": str, "chat_id": int, "msg_id": int}
+active_jobs = {}
+
+def register_job(job_id: str, task: asyncio.Task, temp_path: str, chat_id: int, msg_id: int):
+    active_jobs[job_id] = {
+        "task": task,
+        "temp_path": temp_path,
+        "chat_id": chat_id,
+        "msg_id": msg_id,
+    }
+
+def unregister_job(job_id: str):
+    active_jobs.pop(job_id, None)
+
+def cancel_all_jobs():
+    """Cancela todas las tareas en curso y devuelve info para reportar."""
+    cancelled = []
+    for job_id, info in list(active_jobs.items()):
+        task = info["task"]
+        if not task.done():
+            task.cancel()
+            cancelled.append(info)
+        active_jobs.pop(job_id, None)
+    return cancelled
+
+
 # ----------------- Utilidades -----------------
 def format_size(b: int) -> str:
     if b < 1024:
@@ -77,7 +104,6 @@ class EditState:
 edit_locks = {}
 
 async def edit_status(client: Client, chat_id: int, msg_id: int, text: str, force: bool = False):
-    """Edita el mensaje con throttle de ~1.2s para no chocar con el rate limit."""
     key = chat_id
     st = edit_locks.setdefault(key, EditState())
     now = time.time()
@@ -131,29 +157,14 @@ async def subir_a_s3(session: aiohttp.ClientSession, temp_path: str, filename: s
     return upload_url
 
 
-# ----------------- Manejadores -----------------
-@app.on_message(filters.command("start"))
-async def cmd_start(client: Client, message: Message):
-    await message.reply_text(
-        "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
-    )
-
-
-@app.on_message(filters.text & ~filters.command(["start"]))
-async def handle_text(client: Client, message: Message):
-    match = URL_RE.search(message.text.strip())
-    if not match:
-        await message.reply_text(
-            "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
-        )
-        return
-
-    url = match.group(1)
-    status = await message.reply_text("PROCESSING...")
-
+# ----------------- Lógica de trabajo (URL) -----------------
+async def procesar_url(client: Client, message: Message, url: str, status_id: int, job_id: str):
     filename = get_filename_from_url(url) or f"file_{int(time.time())}"
     ext = os.path.splitext(filename)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+
+    # Registramos la tarea actual (la del job)
+    register_job(job_id, asyncio.current_task(), temp_path, message.chat.id, status_id)
 
     try:
         async with aiohttp.ClientSession() as session:
@@ -173,19 +184,19 @@ async def handle_text(client: Client, message: Message):
                             if pct - last_pct >= 5 or pct == 100:
                                 last_pct = pct
                                 await edit_status(
-                                    client, message.chat.id, status.id,
+                                    client, message.chat.id, status_id,
                                     f"┎ DOWNLOADING\n┠ [{progress_bar(pct)}]\n"
                                     f"┠ PERCENTAGE: {pct}%\n"
                                     f"┖ SIZE: {format_size(downloaded)}/{format_size(total)}"
                                 )
 
             size = os.path.getsize(temp_path)
-            await edit_status(client, message.chat.id, status.id, "UPLOADING...", force=True)
+            await edit_status(client, message.chat.id, status_id, "UPLOADING...", force=True)
 
             async def on_up(sent, total):
                 pct = int(sent / total * 100) if total else 0
                 await edit_status(
-                    client, message.chat.id, status.id,
+                    client, message.chat.id, status_id,
                     f"┎ UPLOADING\n┠ [{progress_bar(pct)}]\n"
                     f"┠ PERCENTAGE: {pct}%\n"
                     f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
@@ -195,20 +206,142 @@ async def handle_text(client: Client, message: Message):
 
         name = os.path.splitext(filename)[0].replace("_", " ")
         await client.edit_message_text(
-            message.chat.id, status.id,
+            message.chat.id, status_id,
             f"┎ NAME: {name}\n┠ EXTENSION: {ext.replace('.', '')}\n"
             f"┠ SIZE: {format_size(size)}\n┖ URL: {upload_url}"
         )
+    except asyncio.CancelledError:
+        log.info(f"Trabajo {job_id} cancelado (URL)")
+        try:
+            await client.edit_message_text(
+                message.chat.id, status_id, "❌ CANCELADO"
+            )
+        except Exception:
+            pass
+        raise
     except Exception as e:
         log.exception("error procesando URL")
-        await client.edit_message_text(
-            message.chat.id, status.id, f"ERROR: {str(e)[:200]}"
-        )
+        try:
+            await client.edit_message_text(
+                message.chat.id, status_id, f"ERROR: {str(e)[:200]}"
+            )
+        except Exception:
+            pass
     finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
+        unregister_job(job_id)
+
+
+# ----------------- Lógica de trabajo (Archivo) -----------------
+async def procesar_archivo(client: Client, message: Message, original_name: str,
+                           status_id: int, job_id: str):
+    ext = os.path.splitext(original_name)[1] or ".bin"
+    temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+
+    register_job(job_id, asyncio.current_task(), temp_path, message.chat.id, status_id)
+
+    try:
+        async def on_dl(current, total):
+            if total:
+                pct = int(current / total * 100)
+                await edit_status(
+                    client, message.chat.id, status_id,
+                    f"┎ DOWNLOADING FROM TELEGRAM\n┠ [{progress_bar(pct)}]\n"
+                    f"┠ PERCENTAGE: {pct}%\n"
+                    f"┖ SIZE: {format_size(current)}/{format_size(total)}"
+                )
+
+        await message.download(file_name=temp_path, progress=on_dl)
+        size = os.path.getsize(temp_path)
+
+        await edit_status(client, message.chat.id, status_id, "UPLOADING...", force=True)
+
+        async with aiohttp.ClientSession() as session:
+            async def on_up(sent, total):
+                pct = int(sent / total * 100) if total else 0
+                await edit_status(
+                    client, message.chat.id, status_id,
+                    f"┎ UPLOADING\n┠ [{progress_bar(pct)}]\n"
+                    f"┠ PERCENTAGE: {pct}%\n"
+                    f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
+                )
+
+            upload_url = await subir_a_s3(session, temp_path, original_name, size, on_up)
+
+        name = os.path.splitext(original_name)[0].replace("_", " ")
+        await client.edit_message_text(
+            message.chat.id, status_id,
+            f"┎ NAME: {name}\n┠ EXTENSION: {ext.replace('.', '')}\n"
+            f"┠ SIZE: {format_size(size)}\n┖ URL: {upload_url}"
+        )
+    except asyncio.CancelledError:
+        log.info(f"Trabajo {job_id} cancelado (archivo)")
+        try:
+            await client.edit_message_text(
+                message.chat.id, status_id, "❌ CANCELADO"
+            )
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.exception("error procesando archivo")
+        try:
+            await client.edit_message_text(
+                message.chat.id, status_id, f"ERROR: {str(e)[:200]}"
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
+        unregister_job(job_id)
+
+
+# ----------------- Manejadores -----------------
+@app.on_message(filters.command("start"))
+async def cmd_start(client: Client, message: Message):
+    await message.reply_text(
+        "Envíame un enlace de descarga directa o un archivo (hasta 2 GB).\n"
+        "Usa /cancel para detener los procesos en curso."
+    )
+
+
+@app.on_message(filters.command("cancel"))
+async def cmd_cancel(client: Client, message: Message):
+    cancelled = cancel_all_jobs()
+    if not cancelled:
+        await message.reply_text("ℹ️ No hay procesos en curso.")
+        return
+    await message.reply_text(f"❌ Cancelando {len(cancelled)} proceso(s)...")
+
+
+@app.on_message(filters.text & ~filters.command(["start", "cancel"]))
+async def handle_text(client: Client, message: Message):
+    match = URL_RE.search(message.text.strip())
+    if not match:
+        await message.reply_text(
+            "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
+        )
+        return
+
+    url = match.group(1)
+    status = await message.reply_text("PROCESSING...")
+
+    job_id = uuid.uuid4().hex
+    task = asyncio.create_task(
+        procesar_url(client, message, url, status.id, job_id)
+    )
+
+    # Esperamos a que termine (sin bloquear Pyrogram)
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 @app.on_message(
@@ -234,7 +367,6 @@ async def handle_media(client: Client, message: Message):
 
     original_name = getattr(media, "file_name", None)
     if not original_name:
-        # Nombre por defecto según el tipo
         if message.photo:
             original_name = f"photo_{int(time.time())}.jpg"
         elif message.video:
@@ -252,56 +384,16 @@ async def handle_media(client: Client, message: Message):
         else:
             original_name = f"file_{int(time.time())}.bin"
 
-    ext = os.path.splitext(original_name)[1] or ".bin"
-    temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
-
     status = await message.reply_text("PROCESSING...")
+    job_id = uuid.uuid4().hex
+    task = asyncio.create_task(
+        procesar_archivo(client, message, original_name, status.id, job_id)
+    )
 
     try:
-        # Descarga vía MTProto (hasta 2 GB)
-        async def on_dl(current, total):
-            if total:
-                pct = int(current / total * 100)
-                await edit_status(
-                    client, message.chat.id, status.id,
-                    f"┎ DOWNLOADING FROM TELEGRAM\n┠ [{progress_bar(pct)}]\n"
-                    f"┠ PERCENTAGE: {pct}%\n"
-                    f"┖ SIZE: {format_size(current)}/{format_size(total)}"
-                )
-
-        await message.download(file_name=temp_path, progress=on_dl)
-        size = os.path.getsize(temp_path)
-
-        await edit_status(client, message.chat.id, status.id, "UPLOADING...", force=True)
-
-        async with aiohttp.ClientSession() as session:
-            async def on_up(sent, total):
-                pct = int(sent / total * 100) if total else 0
-                await edit_status(
-                    client, message.chat.id, status.id,
-                    f"┎ UPLOADING\n┠ [{progress_bar(pct)}]\n"
-                    f"┠ PERCENTAGE: {pct}%\n"
-                    f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
-                )
-
-            upload_url = await subir_a_s3(session, temp_path, original_name, size, on_up)
-
-        name = os.path.splitext(original_name)[0].replace("_", " ")
-        await client.edit_message_text(
-            message.chat.id, status.id,
-            f"┎ NAME: {name}\n┠ EXTENSION: {ext.replace('.', '')}\n"
-            f"┠ SIZE: {format_size(size)}\n┖ URL: {upload_url}"
-        )
-    except Exception as e:
-        log.exception("error procesando archivo")
-        await client.edit_message_text(
-            message.chat.id, status.id, f"ERROR: {str(e)[:200]}"
-        )
-    finally:
-        try:
-            os.unlink(temp_path)
-        except Exception:
-            pass
+        await task
+    except asyncio.CancelledError:
+        pass
 
 
 # ----------------- Servidor web para Render -----------------
@@ -337,17 +429,11 @@ async def keepalive():
 
 # ----------------- Arranque -----------------
 async def main():
-    # Servidor web en hilo aparte
     threading.Thread(target=run_web, daemon=True).start()
-
-    # Cliente Pyrogram
     await app.start()
-
-    # Tarea de keep-alive
     asyncio.create_task(keepalive())
-
     log.info("BOT READY")
-    await asyncio.Event().wait()  # mantener vivo
+    await asyncio.Event().wait()
 
 
 if __name__ == "__main__":
