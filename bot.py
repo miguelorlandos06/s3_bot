@@ -19,7 +19,7 @@ API_HASH = "cb57130abda56877acf3b3027e569450"
 S3 = "https://s3.todus.cu/stream"
 DOWNLOAD_PATH = "/tmp/todus_uploads"
 MAX_FILE_SIZE = 2000 * 1024 * 1024  # 2 GB
-SELF_URL = "https://tu-servicio.onrender.com"  # cámbialo por tu URL real
+SELF_URL = "https://s3-bot-r85n.onrender.com"  # cámbialo por tu URL real
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
