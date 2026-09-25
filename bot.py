@@ -2,7 +2,7 @@
 Bot de subida a Todus S3 con multipart upload - PÚBLICO - Render (plan gratis).
 
 Requisitos:
-    Python 3.11+
+    Python 3.11+ (fijar PYTHON_VERSION=3.11.9 en Render)
 
 Notas Render:
     - Solo escribe en /tmp y working dir (todo efímero entre deploys)
@@ -48,7 +48,7 @@ from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
 # Configuración
 # ============================================================
 
-BOT_TOKEN = "8942582638:AAF1MQGDLVPqbLxwKX3RbEeLDYfHzUzp5I"
+BOT_TOKEN = "8942582638:AAF1MQGDLVPqbLxwK3X2RbEeLDYfHzUzp5I"
 API_ID = 32471788
 API_HASH = "cb57130abda56877acf3b3027e569450"
 
@@ -63,7 +63,7 @@ SESSION_NAME = "todus_bot"
 
 # Render asigna el puerto dinámicamente y necesita bind en 0.0.0.0
 PORT = int(os.environ.get("PORT", 10000))
-SELF_URL = os.environ.get("SELF_URL", "https://s3-bot-r85n.onrender.com")
+SELF_URL = os.environ.get("SELF_URL", "https://s3-bot-y4ap.onrender.com")
 
 MAX_FILE_SIZE = 500 * 1024 * 1024     # 500 MB (Render free: /tmp limitado a ~512MB)
 MAX_CONCURRENT_JOBS = 1                # 512 MB RAM
