@@ -475,7 +475,7 @@ async def procesar_archivo(client: Client, message: Message, original_name: str,
 async def cmd_start(client: Client, message: Message):
     await message.reply_text(
         "**Bot de subida a Todus S3**\n\n"
-        "Envíame un enlace de descarga directa o un archivo (hasta 2 GB).\n"
+        "Envíame un enlace de descarga directa o un archivo (hasta 800 MB).\n"
         "El archivo se sube a `s3.todus.cu/stream` y te devuelvo el enlace público.\n\n"
         "Comandos:\n"
         "• /start — este mensaje\n"
