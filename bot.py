@@ -1,13 +1,15 @@
 """
-Bot de subida a Todus S3 con multipart upload - Versión Render (plan gratis)
+Bot de subida a Todus S3 con multipart upload - Cola global FIFO.
 
 - Descarga desde URL (aiohttp) o desde Telegram (Pyrogram)
 - Sube a s3.todus.cu/stream con aioboto3 (multipart automático)
-- Progreso en vivo con throttle
-- Cancelación de trabajos con /cancel
+- Cola global FIFO con 1 worker (evita saturar el bot)
+- Límite de 800 MB por archivo, verificado antes y durante la descarga
+- 1 job por usuario (no acapara la cola)
+- Posición visible en la cola
+- Cancelación individual (/cancel saca de la cola o aborta el activo)
 - Health server async con aiohttp en 0.0.0.0:$PORT
 - Keepalive cada 10 min para evitar el sleep de Render
-- Optimizado para Render free: 512MB RAM, CPU compartida
 """
 
 import os
@@ -41,26 +43,22 @@ S3_ENDPOINT = "https://s3.todus.cu"
 S3_BUCKET = "stream"
 S3_REGION = "us-east-1"
 
-# Rutas: Render solo permite escribir en /tmp y en el working dir
 DOWNLOAD_PATH = "/tmp/todus_uploads"
 SESSION_DIR = "/tmp/todus_session"
 SESSION_NAME = "todus_bot"
 
-# URL pública del servicio en Render (para el keepalive)
 SELF_URL = os.environ.get("SELF_URL", "https://s3-bot-y4ap.onrender.com")
-
-# Render asigna el puerto dinámicamente
 PORT = int(os.environ.get("PORT", 10000))
 
-MAX_FILE_SIZE = 2000 * 1024 * 1024   # 2 GB
-MAX_CONCURRENT_JOBS = 1              # Render free: 512MB RAM -> 1 job a la vez
+MAX_FILE_SIZE = 400 * 1024 * 1024   # 400 MB
+QUEUE_WORKERS = 1                    # 1 worker en Render free (512MB RAM)
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
 
 
 # ============================================================
-# Logging (solo a stdout, Render lo captura automáticamente)
+# Logging
 # ============================================================
 
 logging.basicConfig(
@@ -71,7 +69,7 @@ log = logging.getLogger("bot")
 
 
 # ============================================================
-# Cliente Pyrogram (workers bajos por RAM limitada)
+# Cliente Pyrogram
 # ============================================================
 
 app = Client(
@@ -84,7 +82,7 @@ app = Client(
 
 
 # ============================================================
-# Configuración S3 (ajustada para RAM limitada de Render)
+# Configuración S3
 # ============================================================
 
 _S3_CONFIG = BotoConfig(
@@ -96,9 +94,9 @@ _S3_CONFIG = BotoConfig(
 )
 
 _TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=8 * 1024 * 1024,     # >=8MB -> multipart
-    multipart_chunksize=8 * 1024 * 1024,     # 8MB por parte (mínimo válido)
-    max_concurrency=2,                        # Poco paralelismo por RAM
+    multipart_threshold=8 * 1024 * 1024,
+    multipart_chunksize=8 * 1024 * 1024,
+    max_concurrency=2,
     use_threads=True,
 )
 
@@ -106,53 +104,161 @@ _s3_session = aioboto3.Session()
 
 
 # ============================================================
-# Job Manager
+# Cola global FIFO
 # ============================================================
 
-class JobManager:
-    """Maneja trabajos activos con límite de concurrencia."""
+class QueuedJob:
+    """Representa un job en la cola."""
 
-    def __init__(self):
-        self._jobs: dict[str, dict] = {}
+    __slots__ = (
+        "job_id", "user_id", "chat_id", "msg_id",
+        "kind", "url", "original_name", "original_msg_id",
+        "task", "created_at", "cancel_requested",
+    )
+
+    def __init__(
+        self,
+        user_id: int,
+        chat_id: int,
+        msg_id: int,
+        kind: str,
+        url: str | None = None,
+        original_name: str | None = None,
+        original_msg_id: int | None = None,
+    ):
+        self.job_id = uuid.uuid4().hex
+        self.user_id = user_id
+        self.chat_id = chat_id
+        self.msg_id = msg_id                            # mensaje de estado (editable)
+        self.kind = kind                                # "url" | "file"
+        self.url = url
+        self.original_name = original_name
+        self.original_msg_id = original_msg_id          # mensaje del archivo original
+        self.task: asyncio.Task | None = None
+        self.created_at = time.time()
+        self.cancel_requested = False
+
+
+class JobQueue:
+    """
+    Cola global FIFO.
+    - 1 job por usuario (activo o en cola)
+    - Workers de fondo consumen la cola en orden
+    """
+
+    def __init__(self, n_workers: int):
+        self.queue: asyncio.Queue[QueuedJob] = asyncio.Queue()
+        self.n_workers = n_workers
+        self.workers: list[asyncio.Task] = []
+        self.user_pending: dict[int, QueuedJob] = {}
+        self.active_jobs: dict[str, QueuedJob] = {}
         self._lock = asyncio.Lock()
-        self._semaphore = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-    async def register(self, task: asyncio.Task, chat_id: int, msg_id: int, temp_path: str) -> str:
+    async def enqueue(self, job: QueuedJob) -> int:
         async with self._lock:
-            job_id = uuid.uuid4().hex
-            self._jobs[job_id] = {
-                "task": task,
-                "chat_id": chat_id,
-                "msg_id": msg_id,
-                "temp_path": temp_path,
-                "created_at": time.time(),
-            }
-            return job_id
+            if job.user_id in self.user_pending:
+                raise ValueError("user_already_queued")
+            self.user_pending[job.user_id] = job
+            await self.queue.put(job)
+            return self.queue.qsize()
 
-    async def unregister(self, job_id: str):
+    async def mark_active(self, job: QueuedJob):
         async with self._lock:
-            self._jobs.pop(job_id, None)
+            self.active_jobs[job.job_id] = job
 
-    async def cancel_all(self) -> list[dict]:
+    async def finish(self, job: QueuedJob):
         async with self._lock:
-            cancelled = []
-            for job_id, info in list(self._jobs.items()):
-                task = info["task"]
-                if not task.done():
+            self.active_jobs.pop(job.job_id, None)
+            current = self.user_pending.get(job.user_id)
+            if current is not None and current.job_id == job.job_id:
+                self.user_pending.pop(job.user_id, None)
+
+    def position_of(self, user_id: int) -> int | None:
+        """Posición en la cola (0 = procesándose ahora, N = posición N)."""
+        job = self.user_pending.get(user_id)
+        if job is None:
+            return None
+        if job.job_id in self.active_jobs:
+            return 0
+        for i, queued in enumerate(self.queue._queue):  # noqa: SLF001
+            if queued.job_id == job.job_id:
+                return i + 1
+        return None
+
+    def has_user_job(self, user_id: int) -> bool:
+        return user_id in self.user_pending
+
+    async def cancel_user(self, user_id: int) -> str:
+        """Devuelve: 'active' | 'queued' | 'none'."""
+        async with self._lock:
+            job = self.user_pending.get(user_id)
+            if job is None:
+                return "none"
+
+            if job.job_id in self.active_jobs:
+                job.cancel_requested = True
+                task = job.task
+                if task is not None and not task.done():
                     task.cancel()
-                    cancelled.append(info)
-                self._jobs.pop(job_id, None)
-            return cancelled
+                return "active"
+
+            # Está en cola: reconstruimos la cola sin ese job
+            self.user_pending.pop(user_id, None)
+            items = list(self.queue._queue)  # noqa: SLF001
+            self.queue._queue.clear()        # noqa: SLF001
+            for item in items:
+                if item.job_id != job.job_id:
+                    self.queue._queue.append(item)  # noqa: SLF001
+            return "queued"
+
+    @property
+    def queued_count(self) -> int:
+        return self.queue.qsize()
 
     @property
     def active_count(self) -> int:
-        return len(self._jobs)
+        return len(self.active_jobs)
 
-    def semaphore(self) -> asyncio.Semaphore:
-        return self._semaphore
+    def start_workers(self, process_fn):
+        for i in range(self.n_workers):
+            self.workers.append(asyncio.create_task(self._worker_loop(i, process_fn)))
+
+    async def _worker_loop(self, worker_id: int, process_fn):
+        log.info(f"Worker #{worker_id} arrancado")
+        while True:
+            job = await self.queue.get()
+            try:
+                if job.cancel_requested:
+                    continue
+                await self.mark_active(job)
+                await notify_processing(job)
+                job.task = asyncio.create_task(process_fn(job))
+                try:
+                    await job.task
+                except asyncio.CancelledError:
+                    # El job fue cancelado individualmente, no el worker
+                    log.info(f"Job {job.job_id} cancelado")
+                except Exception as e:
+                    log.exception(f"job {job.job_id} falló: {e}")
+            except asyncio.CancelledError:
+                log.info(f"Worker #{worker_id} detenido")
+                raise
+            finally:
+                await self.finish(job)
+                self.queue.task_done()
+
+    async def stop_workers(self):
+        for w in self.workers:
+            w.cancel()
+        for w in self.workers:
+            try:
+                await w
+            except asyncio.CancelledError:
+                pass
+        self.workers.clear()
 
 
-job_manager = JobManager()
+job_queue = JobQueue(QUEUE_WORKERS)
 
 
 # ============================================================
@@ -190,9 +296,18 @@ def get_filename_from_url(url: str) -> str | None:
 def sanitize_filename(name: str) -> str:
     """Evita caracteres que rompen la key de S3 y la URL del botón."""
     name = name.replace("/", "_").replace("\\", "_")
-    # Limpia espacios, ?, #, & que rompen URLs
     name = re.sub(r"[\s?#&]+", "_", name)
     return name.strip("._") or f"file_{int(time.time())}"
+
+
+def check_disk_space():
+    st = os.statvfs(DOWNLOAD_PATH)
+    free = st.f_bavail * st.f_frsize
+    if free < MAX_FILE_SIZE:
+        raise RuntimeError(
+            f"Disco insuficiente: {format_size(free)} libres, "
+            f"se necesitan {format_size(MAX_FILE_SIZE)}"
+        )
 
 
 # ============================================================
@@ -209,7 +324,6 @@ _edit_locks: dict[int, asyncio.Lock] = {}
 
 
 async def edit_status(client: Client, chat_id: int, msg_id: int, text: str, force: bool = False):
-    """Edita el mensaje de estado con throttle para no saturar Telegram."""
     state = _edit_states.setdefault(chat_id, EditState())
     lock = _edit_locks.setdefault(chat_id, asyncio.Lock())
 
@@ -227,17 +341,21 @@ async def edit_status(client: Client, chat_id: int, msg_id: int, text: str, forc
             log.debug(f"edit_status falló: {e}")
 
 
+async def notify_processing(job: QueuedJob):
+    try:
+        await app.edit_message_text(
+            job.chat_id, job.msg_id,
+            "▶️ Procesando...\nEsperando datos iniciales..."
+        )
+    except Exception as e:
+        log.debug(f"notify_processing falló: {e}")
+
+
 # ============================================================
 # Subida a S3 con aioboto3
 # ============================================================
 
 async def subir_a_s3(temp_path: str, filename: str, size: int, on_progress=None) -> str:
-    """
-    Sube un archivo a Todus S3 (bucket público stream).
-
-    - <8MB: PutObject simple
-    - >=8MB: multipart con partes de 8MB y 2 en paralelo
-    """
     safe_name = sanitize_filename(filename)
     remote_key = f"{uuid.uuid4().hex[:8]}_{safe_name}"
 
@@ -245,7 +363,6 @@ async def subir_a_s3(temp_path: str, filename: str, size: int, on_progress=None)
     last_update = [0.0]
 
     def _progress_callback(bytes_transferred: int):
-        # Llamado desde threads internos de boto3 (NO desde el event loop)
         if on_progress is None:
             return
         now = loop.time()
@@ -253,8 +370,7 @@ async def subir_a_s3(temp_path: str, filename: str, size: int, on_progress=None)
             return
         last_update[0] = now
         asyncio.run_coroutine_threadsafe(
-            on_progress(bytes_transferred, size),
-            loop,
+            on_progress(bytes_transferred, size), loop
         )
 
     async with _s3_session.client(
@@ -275,196 +391,193 @@ async def subir_a_s3(temp_path: str, filename: str, size: int, on_progress=None)
                 Callback=_progress_callback,
             )
 
-    # ✅ ÚNICA CORRECCIÓN: quote() para que Telegram acepte la URL del botón
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
 
 
 # ============================================================
-# Trabajo: procesar URL
+# Procesamiento de jobs (llamado por el worker)
 # ============================================================
 
-async def procesar_url(client: Client, message: Message, url: str, status_id: int, job_id_holder: dict):
+async def process_job(job: QueuedJob):
+    if job.kind == "url":
+        await _process_url(job)
+    else:
+        await _process_file(job)
+
+
+async def _process_url(job: QueuedJob):
+    url = job.url
     filename = get_filename_from_url(url) or f"file_{int(time.time())}"
     filename = sanitize_filename(filename)
     ext = os.path.splitext(filename)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
 
-    job_id = await job_manager.register(
-        asyncio.current_task(), message.chat.id, status_id, temp_path
-    )
-    job_id_holder["job_id"] = job_id
+    try:
+        check_disk_space()
 
-    async with job_manager.semaphore():
-        try:
-            # 1) Descarga desde URL externa
-            async with aiohttp.ClientSession() as session:
-                async with asyncio.timeout(3600):
-                    async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                        if resp.status >= 400:
-                            raise RuntimeError(f"HTTP {resp.status}")
-                        total = int(resp.headers.get("Content-Length", 0))
-                        if total and total > MAX_FILE_SIZE:
-                            raise RuntimeError(
-                                f"Archivo {format_size(total)} supera el límite "
-                                f"de {format_size(MAX_FILE_SIZE)}"
-                            )
-                        downloaded = 0
-                        last_pct = -1
+        async with aiohttp.ClientSession() as session:
+            async with asyncio.timeout(3600):
+                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
+                    if resp.status >= 400:
+                        raise RuntimeError(f"HTTP {resp.status}")
 
-                        with open(temp_path, "wb") as f:
-                            async for chunk in resp.content.iter_chunked(64 * 1024):
-                                f.write(chunk)
-                                downloaded += len(chunk)
-                                if total:
-                                    pct = int(downloaded / total * 100)
-                                    if pct - last_pct >= 5 or pct == 100:
-                                        last_pct = pct
-                                        await edit_status(
-                                            client, message.chat.id, status_id,
-                                            f"┎ DOWNLOADING\n"
-                                            f"┠ [{progress_bar(pct)}]\n"
-                                            f"┠ PERCENTAGE: {pct}%\n"
-                                            f"┖ SIZE: {format_size(downloaded)}/{format_size(total)}"
-                                        )
+                    total = int(resp.headers.get("Content-Length", 0))
+                    if total and total > MAX_FILE_SIZE:
+                        raise RuntimeError(
+                            f"Archivo {format_size(total)} supera el límite "
+                            f"de {format_size(MAX_FILE_SIZE)}"
+                        )
 
-            size = os.path.getsize(temp_path)
-            if size > MAX_FILE_SIZE:
-                raise RuntimeError(f"Archivo {format_size(size)} supera el límite")
+                    downloaded = 0
+                    last_pct = -1
 
-            # 2) Subida a S3
-            await edit_status(client, message.chat.id, status_id, "UPLOADING...", force=True)
+                    with open(temp_path, "wb") as f:
+                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                            f.write(chunk)
+                            downloaded += len(chunk)
 
-            async def on_up(sent, total):
-                pct = int(sent / total * 100) if total else 0
-                await edit_status(
-                    client, message.chat.id, status_id,
-                    f"┎ UPLOADING\n"
-                    f"┠ [{progress_bar(pct)}]\n"
-                    f"┠ PERCENTAGE: {pct}%\n"
-                    f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
-                )
+                            if downloaded > MAX_FILE_SIZE:
+                                raise RuntimeError(
+                                    f"Archivo supera el límite de "
+                                    f"{format_size(MAX_FILE_SIZE)} durante la descarga"
+                                )
 
-            upload_url = await subir_a_s3(temp_path, filename, size, on_up)
+                            if total:
+                                pct = int(downloaded / total * 100)
+                                if pct - last_pct >= 5 or pct == 100:
+                                    last_pct = pct
+                                    await edit_status(
+                                        app, job.chat_id, job.msg_id,
+                                        f"┎ DOWNLOADING\n"
+                                        f"┠ [{progress_bar(pct)}]\n"
+                                        f"┠ PERCENTAGE: {pct}%\n"
+                                        f"┖ SIZE: {format_size(downloaded)}/{format_size(total)}"
+                                    )
 
-            # 3) Mensaje final con botón inline
-            name = os.path.splitext(filename)[0].replace("_", " ")
-            ext_clean = ext.replace(".", "")
-            await client.edit_message_text(
-                message.chat.id, status_id,
-                f"┎ NAME: {name}\n"
-                f"┠ EXTENSION: {ext_clean}\n"
-                f"┠ SIZE: {format_size(size)}\n"
-                f"┖ URL: {upload_url}",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
-                ]]),
+        size = os.path.getsize(temp_path)
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(f"Archivo {format_size(size)} supera el límite")
+
+        await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
+
+        async def on_up(sent, total):
+            pct = int(sent / total * 100) if total else 0
+            await edit_status(
+                app, job.chat_id, job.msg_id,
+                f"┎ UPLOADING\n"
+                f"┠ [{progress_bar(pct)}]\n"
+                f"┠ PERCENTAGE: {pct}%\n"
+                f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
             )
 
-        except asyncio.CancelledError:
-            log.info(f"Trabajo {job_id} cancelado (URL)")
-            try:
-                await client.edit_message_text(message.chat.id, status_id, "❌ CANCELADO")
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            log.exception("error procesando URL")
-            try:
-                await client.edit_message_text(
-                    message.chat.id, status_id, f"ERROR: {str(e)[:200]}"
-                )
-            except Exception:
-                pass
-        finally:
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
-            await job_manager.unregister(job_id)
+        upload_url = await subir_a_s3(temp_path, filename, size, on_up)
+
+        name = os.path.splitext(filename)[0].replace("_", " ")
+        ext_clean = ext.replace(".", "")
+        await app.edit_message_text(
+            job.chat_id, job.msg_id,
+            f"┎ NAME: {name}\n"
+            f"┠ EXTENSION: {ext_clean}\n"
+            f"┠ SIZE: {format_size(size)}\n"
+            f"┖ URL: {upload_url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
+            ]]),
+        )
+
+    except asyncio.CancelledError:
+        log.info(f"Job {job.job_id} cancelado (URL)")
+        try:
+            await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.exception("error procesando URL")
+        try:
+            await app.edit_message_text(
+                job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}"
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
 
 
-# ============================================================
-# Trabajo: procesar archivo de Telegram
-# ============================================================
-
-async def procesar_archivo(client: Client, message: Message, original_name: str,
-                           status_id: int, job_id_holder: dict):
-    original_name = sanitize_filename(original_name)
+async def _process_file(job: QueuedJob):
+    original_name = sanitize_filename(job.original_name or f"file_{int(time.time())}")
     ext = os.path.splitext(original_name)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
 
-    job_id = await job_manager.register(
-        asyncio.current_task(), message.chat.id, status_id, temp_path
-    )
-    job_id_holder["job_id"] = job_id
+    try:
+        check_disk_space()
 
-    async with job_manager.semaphore():
-        try:
-            # 1) Descarga desde Telegram
-            async def on_dl(current, total):
-                if total:
-                    pct = int(current / total * 100)
-                    await edit_status(
-                        client, message.chat.id, status_id,
-                        f"┎ DOWNLOADING FROM TELEGRAM\n"
-                        f"┠ [{progress_bar(pct)}]\n"
-                        f"┠ PERCENTAGE: {pct}%\n"
-                        f"┖ SIZE: {format_size(current)}/{format_size(total)}"
-                    )
-
-            await message.download(file_name=temp_path, progress=on_dl)
-            size = os.path.getsize(temp_path)
-
-            # 2) Subida a S3
-            await edit_status(client, message.chat.id, status_id, "UPLOADING...", force=True)
-
-            async def on_up(sent, total):
-                pct = int(sent / total * 100) if total else 0
+        async def on_dl(current, total):
+            if total:
+                pct = int(current / total * 100)
                 await edit_status(
-                    client, message.chat.id, status_id,
-                    f"┎ UPLOADING\n"
+                    app, job.chat_id, job.msg_id,
+                    f"┎ DOWNLOADING FROM TELEGRAM\n"
                     f"┠ [{progress_bar(pct)}]\n"
                     f"┠ PERCENTAGE: {pct}%\n"
-                    f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
+                    f"┖ SIZE: {format_size(current)}/{format_size(total)}"
                 )
 
-            upload_url = await subir_a_s3(temp_path, original_name, size, on_up)
+        # ✅ FIX: usamos el mensaje ORIGINAL del archivo, no el mensaje de estado
+        original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
+        await original_msg.download(file_name=temp_path, progress=on_dl)
+        size = os.path.getsize(temp_path)
 
-            # 3) Mensaje final
-            name = os.path.splitext(original_name)[0].replace("_", " ")
-            ext_clean = ext.replace(".", "")
-            await client.edit_message_text(
-                message.chat.id, status_id,
-                f"┎ NAME: {name}\n"
-                f"┠ EXTENSION: {ext_clean}\n"
-                f"┠ SIZE: {format_size(size)}\n"
-                f"┖ URL: {upload_url}",
-                reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
-                ]]),
+        await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
+
+        async def on_up(sent, total):
+            pct = int(sent / total * 100) if total else 0
+            await edit_status(
+                app, job.chat_id, job.msg_id,
+                f"┎ UPLOADING\n"
+                f"┠ [{progress_bar(pct)}]\n"
+                f"┠ PERCENTAGE: {pct}%\n"
+                f"┖ SIZE: {format_size(sent)}/{format_size(total)}"
             )
 
-        except asyncio.CancelledError:
-            log.info(f"Trabajo {job_id} cancelado (archivo)")
-            try:
-                await client.edit_message_text(message.chat.id, status_id, "❌ CANCELADO")
-            except Exception:
-                pass
-            raise
-        except Exception as e:
-            log.exception("error procesando archivo")
-            try:
-                await client.edit_message_text(
-                    message.chat.id, status_id, f"ERROR: {str(e)[:200]}"
-                )
-            except Exception:
-                pass
-        finally:
-            try:
-                os.unlink(temp_path)
-            except Exception:
-                pass
-            await job_manager.unregister(job_id)
+        upload_url = await subir_a_s3(temp_path, original_name, size, on_up)
+
+        name = os.path.splitext(original_name)[0].replace("_", " ")
+        ext_clean = ext.replace(".", "")
+        await app.edit_message_text(
+            job.chat_id, job.msg_id,
+            f"┎ NAME: {name}\n"
+            f"┠ EXTENSION: {ext_clean}\n"
+            f"┠ SIZE: {format_size(size)}\n"
+            f"┖ URL: {upload_url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
+            ]]),
+        )
+
+    except asyncio.CancelledError:
+        log.info(f"Job {job.job_id} cancelado (archivo)")
+        try:
+            await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.exception("error procesando archivo")
+        try:
+            await app.edit_message_text(
+                job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}"
+            )
+        except Exception:
+            pass
+    finally:
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
 
 
 # ============================================================
@@ -475,53 +588,97 @@ async def procesar_archivo(client: Client, message: Message, original_name: str,
 async def cmd_start(client: Client, message: Message):
     await message.reply_text(
         "**Bot de subida a Todus S3**\n\n"
-        "Envíame un enlace de descarga directa o un archivo (hasta 800 MB).\n"
+        f"Envíame un enlace o un archivo (máx {format_size(MAX_FILE_SIZE)}).\n"
         "El archivo se sube a `s3.todus.cu/stream` y te devuelvo el enlace público.\n\n"
-        "Comandos:\n"
+        "Los archivos se procesan en **cola FIFO** (1 a la vez).\n"
+        "Solo puedes tener **1 trabajo** activo o en cola.\n\n"
+        "**Comandos:**\n"
         "• /start — este mensaje\n"
-        "• /cancel — detener los procesos en curso\n"
-        "• /status — ver trabajos activos"
+        "• /cancel — cancelar tu trabajo (activo o en cola)\n"
+        "• /status — ver tu posición en la cola"
     )
 
 
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(client: Client, message: Message):
-    cancelled = await job_manager.cancel_all()
-    if not cancelled:
-        await message.reply_text("ℹ️ No hay procesos en curso.")
-        return
-    await message.reply_text(f"❌ Cancelando {len(cancelled)} proceso(s)...")
+    uid = message.from_user.id
+    result = await job_queue.cancel_user(uid)
+    if result == "none":
+        await message.reply_text("ℹ️ No tienes trabajos activos ni en cola.")
+    elif result == "active":
+        await message.reply_text("❌ Cancelando tu trabajo activo...")
+    else:
+        await message.reply_text("✅ Tu trabajo fue removido de la cola.")
 
 
 @app.on_message(filters.command("status"))
 async def cmd_status(client: Client, message: Message):
-    n = job_manager.active_count
-    if n == 0:
-        await message.reply_text("ℹ️ No hay trabajos activos.")
+    uid = message.from_user.id
+    pos = job_queue.position_of(uid)
+
+    total_queued = job_queue.queued_count
+    total_active = job_queue.active_count
+
+    if pos is None:
+        await message.reply_text(
+            f"ℹ️ No tienes trabajos en curso.\n\n"
+            f"📊 Cola global: {total_queued} esperando, {total_active} procesando"
+        )
+    elif pos == 0:
+        await message.reply_text(
+            f"▶️ Tu trabajo está **procesándose ahora**.\n\n"
+            f"📊 Cola global: {total_queued} esperando, {total_active} procesando"
+        )
     else:
-        await message.reply_text(f"⚙️ {n} trabajo(s) activo(s) (límite: {MAX_CONCURRENT_JOBS}).")
+        await message.reply_text(
+            f"⏳ Estás en la **posición #{pos}** de la cola.\n\n"
+            f"📊 Cola global: {total_queued} esperando, {total_active} procesando"
+        )
 
 
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status"]))
 async def handle_text(client: Client, message: Message):
+    uid = message.from_user.id
+
     match = URL_RE.search(message.text.strip())
     if not match:
         await message.reply_text(
-            "Envíame un enlace de descarga directa o un archivo (hasta 2 GB)."
+            f"Envíame un enlace de descarga directa o un archivo "
+            f"(máx {format_size(MAX_FILE_SIZE)})."
+        )
+        return
+
+    if job_queue.has_user_job(uid):
+        await message.reply_text(
+            "⚠️ Ya tienes un trabajo en curso o en cola. "
+            "Usa /status para ver tu posición o /cancel para cancelarlo."
         )
         return
 
     url = match.group(1)
-    status = await message.reply_text("PROCESSING...")
+    status = await message.reply_text("📥 Añadiendo a la cola...")
 
-    holder: dict = {}
-    task = asyncio.create_task(procesar_url(client, message, url, status.id, holder))
+    job = QueuedJob(
+        user_id=uid,
+        chat_id=message.chat.id,
+        msg_id=status.id,
+        kind="url",
+        url=url,
+    )
+
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        log.exception(f"tarea URL falló: {e}")
+        position = await job_queue.enqueue(job)
+    except ValueError:
+        await status.edit_text("⚠️ Ya tienes un trabajo en curso o en cola.")
+        return
+
+    if position == 1:
+        await status.edit_text("▶️ Eres el siguiente, procesando...")
+    else:
+        await status.edit_text(
+            f"⏳ En cola — posición #{position}\n"
+            f"Esperando turno... ({position - 1} delante de ti)"
+        )
 
 
 @app.on_message(
@@ -529,6 +686,8 @@ async def handle_text(client: Client, message: Message):
     filters.video_note | filters.animation | filters.sticker | filters.photo
 )
 async def handle_media(client: Client, message: Message):
+    uid = message.from_user.id
+
     media = (
         message.document or message.video or message.audio or message.voice or
         message.video_note or message.animation or message.sticker or
@@ -542,6 +701,13 @@ async def handle_media(client: Client, message: Message):
         await message.reply_text(
             f"❌ Archivo demasiado grande ({format_size(file_size)}). "
             f"El límite es {format_size(MAX_FILE_SIZE)}."
+        )
+        return
+
+    if job_queue.has_user_job(uid):
+        await message.reply_text(
+            "⚠️ Ya tienes un trabajo en curso o en cola. "
+            "Usa /status para ver tu posición o /cancel para cancelarlo."
         )
         return
 
@@ -565,21 +731,34 @@ async def handle_media(client: Client, message: Message):
         else:
             original_name = f"file_{ts}.bin"
 
-    status = await message.reply_text("PROCESSING...")
-    holder: dict = {}
-    task = asyncio.create_task(
-        procesar_archivo(client, message, original_name, status.id, holder)
+    status = await message.reply_text("📥 Añadiendo a la cola...")
+
+    job = QueuedJob(
+        user_id=uid,
+        chat_id=message.chat.id,
+        msg_id=status.id,
+        kind="file",
+        original_name=original_name,
+        original_msg_id=message.id,   # ✅ FIX: mensaje original del archivo
     )
+
     try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as e:
-        log.exception(f"tarea archivo falló: {e}")
+        position = await job_queue.enqueue(job)
+    except ValueError:
+        await status.edit_text("⚠️ Ya tienes un trabajo en curso o en cola.")
+        return
+
+    if position == 1:
+        await status.edit_text("▶️ Eres el siguiente, procesando...")
+    else:
+        await status.edit_text(
+            f"⏳ En cola — posición #{position}\n"
+            f"Esperando turno... ({position - 1} delante de ti)"
+        )
 
 
 # ============================================================
-# Health server (Render requiere bind en 0.0.0.0 y $PORT)
+# Health server
 # ============================================================
 
 START_TIME = time.time()
@@ -589,8 +768,10 @@ async def health_handler(request: web.Request) -> web.Response:
     return web.json_response({
         "status": "healthy",
         "uptime": round(time.time() - START_TIME, 1),
-        "jobs_active": job_manager.active_count,
-        "jobs_limit": MAX_CONCURRENT_JOBS,
+        "queue_queued": job_queue.queued_count,
+        "queue_active": job_queue.active_count,
+        "workers": QUEUE_WORKERS,
+        "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
     })
 
 
@@ -609,30 +790,28 @@ async def run_web():
     a = make_web_app()
     runner = web.AppRunner(a)
     await runner.setup()
-    site = web.TCPSite(runner, "0.0.0.0", PORT)   # Render requiere 0.0.0.0
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     log.info(f"Health server escuchando en 0.0.0.0:{PORT}")
     return runner
 
 
 # ============================================================
-# Keepalive para evitar el sleep de Render (plan gratis)
+# Keepalive
 # ============================================================
 
 async def keepalive():
-    base_interval = 600       # 10 min
-    max_interval = 3600       # 1h si falla repetido
+    base_interval = 600
+    max_interval = 3600
 
     async with aiohttp.ClientSession() as session:
-        # Espera inicial para que Render termine de levantar
         await asyncio.sleep(60)
-
         while True:
             try:
                 async with session.get(f"{SELF_URL}/health", timeout=15) as r:
                     if r.status == 200:
                         base_interval = 600
-                        log.info(f"keepalive OK")
+                        log.info("keepalive OK")
                     else:
                         log.warning(f"keepalive HTTP {r.status}")
             except Exception as e:
@@ -648,12 +827,17 @@ async def keepalive():
 async def main():
     web_runner = await run_web()
     await app.start()
+    job_queue.start_workers(process_job)
     keepalive_task = asyncio.create_task(keepalive())
-    log.info("BOT READY")
+    log.info(
+        f"BOT READY — {QUEUE_WORKERS} worker(s), "
+        f"límite {format_size(MAX_FILE_SIZE)}"
+    )
     try:
         await asyncio.Event().wait()
     finally:
         keepalive_task.cancel()
+        await job_queue.stop_workers()
         await app.stop()
         await web_runner.cleanup()
 
