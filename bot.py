@@ -10,8 +10,9 @@ Bot de subida a Todus S3 con multipart upload - Cola global FIFO.
 - Botón inline "❌ Cancelar" en mensajes en cola y activos
 - Cancelación individual (/cancel o botón)
 - Health server async con aiohttp en 0.0.0.0:$PORT
-- Keepalive cada 10 min para evitar el sleep de Render
+- Keepalive cada 10 min (con backoff exponencial hasta 60 min si falla)
 - Chunks de descarga: 1 MB (URL y Telegram)
+- Escritura async a disco con aiofiles
 """
 
 import os
@@ -22,6 +23,7 @@ import asyncio
 import logging
 from urllib.parse import urlparse, unquote, quote
 
+import aiofiles
 import aiohttp
 import aioboto3
 from aiohttp import web
@@ -263,7 +265,7 @@ class JobQueue:
         """
         Tarea de fondo: notifica a usuarios en cola cuando cambia su posición.
         - Ignora usuarios con job activo (esos ya tienen barra de progreso).
-        - Throttle implícito por el interval de 3s.
+        - Throttle implícito por el interval de POSITION_POLL_INTERVAL segundos.
         """
         last_positions: dict[int, int] = {}
         while True:
@@ -297,7 +299,7 @@ class JobQueue:
                     except Exception as e:
                         log.debug(f"notify position falló: {e}")
 
-                # Actualizar snapshot (incluye los que desaparecieron → los borramos)
+                # Actualizar snapshot
                 last_positions = dict(current)
             except Exception as e:
                 log.exception(f"_notify_position_changes: {e}")
@@ -494,9 +496,10 @@ async def _process_url(job: QueuedJob):
                     downloaded = 0
                     last_pct = -1
 
-                    with open(temp_path, "wb") as f:
+                    # ✅ Escritura async con aiofiles
+                    async with aiofiles.open(temp_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                            f.write(chunk)
+                            await f.write(chunk)
                             downloaded += len(chunk)
 
                             if downloaded > MAX_FILE_SIZE:
