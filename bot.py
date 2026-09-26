@@ -6,8 +6,9 @@ Bot de subida a Todus S3 con multipart upload - Cola global FIFO.
 - Cola global FIFO con 1 worker (evita saturar el bot)
 - Límite de 500 MB por archivo, verificado antes y durante la descarga
 - 1 job por usuario (no acapara la cola)
-- Posición visible en la cola
-- Cancelación individual (/cancel saca de la cola o aborta el activo)
+- Notificación en vivo de la posición en cola (throttle 3s)
+- Botón inline "❌ Cancelar" en mensajes en cola y activos
+- Cancelación individual (/cancel o botón)
 - Health server async con aiohttp en 0.0.0.0:$PORT
 - Keepalive cada 10 min para evitar el sleep de Render
 - Chunks de descarga: 1 MB (URL y Telegram)
@@ -29,7 +30,12 @@ from botocore.config import Config as BotoConfig
 from boto3.s3.transfer import TransferConfig
 
 from pyrogram import Client, filters
-from pyrogram.types import Message, InlineKeyboardMarkup, InlineKeyboardButton
+from pyrogram.types import (
+    Message,
+    CallbackQuery,
+    InlineKeyboardMarkup,
+    InlineKeyboardButton,
+)
 
 
 # ============================================================
@@ -53,7 +59,8 @@ PORT = int(os.environ.get("PORT", 10000))
 
 MAX_FILE_SIZE = 500 * 1024 * 1024   # 500 MB
 QUEUE_WORKERS = 1                    # 1 worker en Render free (512MB RAM)
-CHUNK_SIZE = 1024 * 1024             # 1 MB (descarga URL y Telegram)
+CHUNK_SIZE = 1024 * 1024             # 1 MB
+POSITION_POLL_INTERVAL = 3           # cada 3s revisa posiciones
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -146,6 +153,7 @@ class JobQueue:
     Cola global FIFO.
     - 1 job por usuario (activo o en cola)
     - Workers de fondo consumen la cola en orden
+    - Notificación en vivo de posición (cada POSITION_POLL_INTERVAL segundos)
     """
 
     def __init__(self, n_workers: int):
@@ -218,9 +226,15 @@ class JobQueue:
     def active_count(self) -> int:
         return len(self.active_jobs)
 
+    # -------- Tareas de fondo --------
+
     def start_workers(self, process_fn):
         for i in range(self.n_workers):
             self.workers.append(asyncio.create_task(self._worker_loop(i, process_fn)))
+        self.workers.append(asyncio.create_task(self._notify_position_changes()))
+        log.info(
+            f"{self.n_workers} worker(s) + notificador de posición arrancados"
+        )
 
     async def _worker_loop(self, worker_id: int, process_fn):
         log.info(f"Worker #{worker_id} arrancado")
@@ -244,6 +258,50 @@ class JobQueue:
             finally:
                 await self.finish(job)
                 self.queue.task_done()
+
+    async def _notify_position_changes(self):
+        """
+        Tarea de fondo: notifica a usuarios en cola cuando cambia su posición.
+        - Ignora usuarios con job activo (esos ya tienen barra de progreso).
+        - Throttle implícito por el interval de 3s.
+        """
+        last_positions: dict[int, int] = {}
+        while True:
+            try:
+                current: dict[int, int] = {}
+                for i, job in enumerate(self.queue._queue):  # noqa: SLF001
+                    # Ignorar jobs activos: su mensaje lo maneja la barra de progreso
+                    if job.job_id in self.active_jobs:
+                        continue
+                    current[job.user_id] = i + 1
+
+                # Notificar solo a los que cambiaron de posición
+                for uid, pos in current.items():
+                    if last_positions.get(uid) == pos:
+                        continue
+                    job = self.user_pending.get(uid)
+                    if not job:
+                        continue
+                    try:
+                        await app.edit_message_text(
+                            job.chat_id, job.msg_id,
+                            f"⏳ En cola — posición #{pos}\n"
+                            f"Esperando turno... ({pos - 1} delante de ti)",
+                            reply_markup=InlineKeyboardMarkup([[
+                                InlineKeyboardButton(
+                                    "❌ Cancelar",
+                                    callback_data=f"cancel:{uid}"
+                                )
+                            ]]),
+                        )
+                    except Exception as e:
+                        log.debug(f"notify position falló: {e}")
+
+                # Actualizar snapshot (incluye los que desaparecieron → los borramos)
+                last_positions = dict(current)
+            except Exception as e:
+                log.exception(f"_notify_position_changes: {e}")
+            await asyncio.sleep(POSITION_POLL_INTERVAL)
 
     async def stop_workers(self):
         for w in self.workers:
@@ -307,6 +365,12 @@ def check_disk_space():
         )
 
 
+def cancel_button(uid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{uid}")
+    ]])
+
+
 # ============================================================
 # Estado de edición con throttle
 # ============================================================
@@ -339,10 +403,12 @@ async def edit_status(client: Client, chat_id: int, msg_id: int, text: str, forc
 
 
 async def notify_processing(job: QueuedJob):
+    """Avisa al usuario que su job salió de la cola y empieza a procesarse."""
     try:
         await app.edit_message_text(
             job.chat_id, job.msg_id,
-            "▶️ Procesando...\nEsperando datos iniciales..."
+            "▶️ Procesando...",
+            reply_markup=cancel_button(job.user_id),
         )
     except Exception as e:
         log.debug(f"notify_processing falló: {e}")
@@ -523,12 +589,11 @@ async def _process_file(job: QueuedJob):
                     f"┖ SIZE: {format_size(current)}/{format_size(total)}"
                 )
 
-        # ✅ Usamos el mensaje ORIGINAL del archivo, no el mensaje de estado
         original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
         await original_msg.download(
             file_name=temp_path,
             progress=on_dl,
-            chunk_size=CHUNK_SIZE,  # 1 MB
+            chunk_size=CHUNK_SIZE,
         )
         size = os.path.getsize(temp_path)
 
@@ -612,6 +677,37 @@ async def cmd_cancel(client: Client, message: Message):
         await message.reply_text("✅ Tu trabajo fue removido de la cola.")
 
 
+@app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
+async def on_cancel_callback(client: Client, callback_query: CallbackQuery):
+    uid = int(callback_query.data.split(":")[1])
+    if callback_query.from_user.id != uid:
+        await callback_query.answer(
+            "⛔ Solo el dueño del trabajo puede cancelarlo.",
+            show_alert=True,
+        )
+        return
+
+    result = await job_queue.cancel_user(uid)
+    if result == "none":
+        await callback_query.answer("ℹ️ No tienes trabajos.", show_alert=True)
+        try:
+            await callback_query.message.edit_text("ℹ️ Sin trabajo pendiente.")
+        except Exception:
+            pass
+    elif result == "active":
+        await callback_query.answer("❌ Cancelando...", show_alert=False)
+        try:
+            await callback_query.message.edit_text("❌ CANCELADO")
+        except Exception:
+            pass
+    else:
+        await callback_query.answer("✅ Removido de la cola.", show_alert=False)
+        try:
+            await callback_query.message.edit_text("❌ CANCELADO")
+        except Exception:
+            pass
+
+
 @app.on_message(filters.command("status"))
 async def cmd_status(client: Client, message: Message):
     uid = message.from_user.id
@@ -633,7 +729,8 @@ async def cmd_status(client: Client, message: Message):
     else:
         await message.reply_text(
             f"⏳ Estás en la **posición #{pos}** de la cola.\n\n"
-            f"📊 Cola global: {total_queued} esperando, {total_active} procesando"
+            f"📊 Cola global: {total_queued} esperando, {total_active} procesando",
+            reply_markup=cancel_button(uid),
         )
 
 
@@ -674,11 +771,15 @@ async def handle_text(client: Client, message: Message):
         return
 
     if position == 1:
-        await status.edit_text("▶️ Eres el siguiente, procesando...")
+        await status.edit_text(
+            "▶️ Eres el siguiente, procesando...",
+            reply_markup=cancel_button(uid),
+        )
     else:
         await status.edit_text(
             f"⏳ En cola — posición #{position}\n"
-            f"Esperando turno... ({position - 1} delante de ti)"
+            f"Esperando turno... ({position - 1} delante de ti)",
+            reply_markup=cancel_button(uid),
         )
 
 
@@ -740,7 +841,7 @@ async def handle_media(client: Client, message: Message):
         msg_id=status.id,
         kind="file",
         original_name=original_name,
-        original_msg_id=message.id,   # mensaje original del archivo
+        original_msg_id=message.id,
     )
 
     try:
@@ -750,11 +851,15 @@ async def handle_media(client: Client, message: Message):
         return
 
     if position == 1:
-        await status.edit_text("▶️ Eres el siguiente, procesando...")
+        await status.edit_text(
+            "▶️ Eres el siguiente, procesando...",
+            reply_markup=cancel_button(uid),
+        )
     else:
         await status.edit_text(
             f"⏳ En cola — posición #{position}\n"
-            f"Esperando turno... ({position - 1} delante de ti)"
+            f"Esperando turno... ({position - 1} delante de ti)",
+            reply_markup=cancel_button(uid),
         )
 
 
