@@ -11,7 +11,7 @@ Bot de subida a Todus S3 con multipart upload - Cola global FIFO.
 - Cancelación individual (/cancel o botón)
 - Health server async con aiohttp en 0.0.0.0:$PORT
 - Keepalive cada 10 min (con backoff exponencial hasta 60 min si falla)
-- Chunks de descarga: 1 MB (URL y Telegram)
+- Chunks de descarga: 1 MB (solo para URL; Telegram usa el interno de Pyrogram)
 - Escritura async a disco con aiofiles
 """
 
@@ -61,7 +61,7 @@ PORT = int(os.environ.get("PORT", 10000))
 
 MAX_FILE_SIZE = 500 * 1024 * 1024   # 500 MB
 QUEUE_WORKERS = 1                    # 1 worker en Render free (512MB RAM)
-CHUNK_SIZE = 1024 * 1024             # 1 MB
+CHUNK_SIZE = 1024 * 1024             # 1 MB (solo aplica a descargas por URL)
 POSITION_POLL_INTERVAL = 3           # cada 3s revisa posiciones
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -272,12 +272,10 @@ class JobQueue:
             try:
                 current: dict[int, int] = {}
                 for i, job in enumerate(self.queue._queue):  # noqa: SLF001
-                    # Ignorar jobs activos: su mensaje lo maneja la barra de progreso
                     if job.job_id in self.active_jobs:
                         continue
                     current[job.user_id] = i + 1
 
-                # Notificar solo a los que cambiaron de posición
                 for uid, pos in current.items():
                     if last_positions.get(uid) == pos:
                         continue
@@ -299,7 +297,6 @@ class JobQueue:
                     except Exception as e:
                         log.debug(f"notify position falló: {e}")
 
-                # Actualizar snapshot
                 last_positions = dict(current)
             except Exception as e:
                 log.exception(f"_notify_position_changes: {e}")
@@ -496,7 +493,6 @@ async def _process_url(job: QueuedJob):
                     downloaded = 0
                     last_pct = -1
 
-                    # ✅ Escritura async con aiofiles
                     async with aiofiles.open(temp_path, "wb") as f:
                         async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                             await f.write(chunk)
@@ -593,10 +589,10 @@ async def _process_file(job: QueuedJob):
                 )
 
         original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
+        # ✅ Fix: Pyrogram no acepta chunk_size en Message.download()
         await original_msg.download(
             file_name=temp_path,
             progress=on_dl,
-            chunk_size=CHUNK_SIZE,
         )
         size = os.path.getsize(temp_path)
 
