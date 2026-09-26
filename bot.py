@@ -4,12 +4,13 @@ Bot de subida a Todus S3 con multipart upload - Cola global FIFO.
 - Descarga desde URL (aiohttp) o desde Telegram (Pyrogram)
 - Sube a s3.todus.cu/stream con aioboto3 (multipart automático)
 - Cola global FIFO con 1 worker (evita saturar el bot)
-- Límite de 800 MB por archivo, verificado antes y durante la descarga
+- Límite de 500 MB por archivo, verificado antes y durante la descarga
 - 1 job por usuario (no acapara la cola)
 - Posición visible en la cola
 - Cancelación individual (/cancel saca de la cola o aborta el activo)
 - Health server async con aiohttp en 0.0.0.0:$PORT
 - Keepalive cada 10 min para evitar el sleep de Render
+- Chunks de descarga: 1 MB (URL y Telegram)
 """
 
 import os
@@ -50,8 +51,9 @@ SESSION_NAME = "todus_bot"
 SELF_URL = os.environ.get("SELF_URL", "https://s3-bot-y4ap.onrender.com")
 PORT = int(os.environ.get("PORT", 10000))
 
-MAX_FILE_SIZE = 400 * 1024 * 1024   # 400 MB
+MAX_FILE_SIZE = 500 * 1024 * 1024   # 500 MB
 QUEUE_WORKERS = 1                    # 1 worker en Render free (512MB RAM)
+CHUNK_SIZE = 1024 * 1024             # 1 MB (descarga URL y Telegram)
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 os.makedirs(SESSION_DIR, exist_ok=True)
@@ -129,11 +131,11 @@ class QueuedJob:
         self.job_id = uuid.uuid4().hex
         self.user_id = user_id
         self.chat_id = chat_id
-        self.msg_id = msg_id                            # mensaje de estado (editable)
-        self.kind = kind                                # "url" | "file"
+        self.msg_id = msg_id
+        self.kind = kind
         self.url = url
         self.original_name = original_name
-        self.original_msg_id = original_msg_id          # mensaje del archivo original
+        self.original_msg_id = original_msg_id
         self.task: asyncio.Task | None = None
         self.created_at = time.time()
         self.cancel_requested = False
@@ -174,7 +176,6 @@ class JobQueue:
                 self.user_pending.pop(job.user_id, None)
 
     def position_of(self, user_id: int) -> int | None:
-        """Posición en la cola (0 = procesándose ahora, N = posición N)."""
         job = self.user_pending.get(user_id)
         if job is None:
             return None
@@ -189,7 +190,6 @@ class JobQueue:
         return user_id in self.user_pending
 
     async def cancel_user(self, user_id: int) -> str:
-        """Devuelve: 'active' | 'queued' | 'none'."""
         async with self._lock:
             job = self.user_pending.get(user_id)
             if job is None:
@@ -202,7 +202,6 @@ class JobQueue:
                     task.cancel()
                 return "active"
 
-            # Está en cola: reconstruimos la cola sin ese job
             self.user_pending.pop(user_id, None)
             items = list(self.queue._queue)  # noqa: SLF001
             self.queue._queue.clear()        # noqa: SLF001
@@ -236,7 +235,6 @@ class JobQueue:
                 try:
                     await job.task
                 except asyncio.CancelledError:
-                    # El job fue cancelado individualmente, no el worker
                     log.info(f"Job {job.job_id} cancelado")
                 except Exception as e:
                     log.exception(f"job {job.job_id} falló: {e}")
@@ -294,7 +292,6 @@ def get_filename_from_url(url: str) -> str | None:
 
 
 def sanitize_filename(name: str) -> str:
-    """Evita caracteres que rompen la key de S3 y la URL del botón."""
     name = name.replace("/", "_").replace("\\", "_")
     name = re.sub(r"[\s?#&]+", "_", name)
     return name.strip("._") or f"file_{int(time.time())}"
@@ -432,7 +429,7 @@ async def _process_url(job: QueuedJob):
                     last_pct = -1
 
                     with open(temp_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
                             f.write(chunk)
                             downloaded += len(chunk)
 
@@ -526,9 +523,13 @@ async def _process_file(job: QueuedJob):
                     f"┖ SIZE: {format_size(current)}/{format_size(total)}"
                 )
 
-        # ✅ FIX: usamos el mensaje ORIGINAL del archivo, no el mensaje de estado
+        # ✅ Usamos el mensaje ORIGINAL del archivo, no el mensaje de estado
         original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
-        await original_msg.download(file_name=temp_path, progress=on_dl)
+        await original_msg.download(
+            file_name=temp_path,
+            progress=on_dl,
+            chunk_size=CHUNK_SIZE,  # 1 MB
+        )
         size = os.path.getsize(temp_path)
 
         await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
@@ -739,7 +740,7 @@ async def handle_media(client: Client, message: Message):
         msg_id=status.id,
         kind="file",
         original_name=original_name,
-        original_msg_id=message.id,   # ✅ FIX: mensaje original del archivo
+        original_msg_id=message.id,   # mensaje original del archivo
     )
 
     try:
@@ -772,6 +773,7 @@ async def health_handler(request: web.Request) -> web.Response:
         "queue_active": job_queue.active_count,
         "workers": QUEUE_WORKERS,
         "max_file_size_mb": MAX_FILE_SIZE // (1024 * 1024),
+        "chunk_size_kb": CHUNK_SIZE // 1024,
     })
 
 
@@ -831,7 +833,8 @@ async def main():
     keepalive_task = asyncio.create_task(keepalive())
     log.info(
         f"BOT READY — {QUEUE_WORKERS} worker(s), "
-        f"límite {format_size(MAX_FILE_SIZE)}"
+        f"límite {format_size(MAX_FILE_SIZE)}, "
+        f"chunk {CHUNK_SIZE // 1024} KB"
     )
     try:
         await asyncio.Event().wait()
