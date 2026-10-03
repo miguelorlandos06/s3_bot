@@ -2,8 +2,6 @@ name: Bot
 
 on:
   workflow_dispatch:
-  schedule:
-    - cron: '*/5 * * * *'
 
 concurrency:
   group: todus-bot
@@ -12,7 +10,7 @@ concurrency:
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 7
+    timeout-minutes: 235
 
     steps:
       - uses: actions/checkout@v4
