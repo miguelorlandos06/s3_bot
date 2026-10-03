@@ -1,0 +1,28 @@
+name: Gen Session
+on:
+  workflow_dispatch:
+jobs:
+  gen:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11.9'
+      - run: pip install pyrogram tgcrypto
+      - name: Generate session string
+        run: |
+          python -c "
+          from pyrogram import Client
+          app = Client(
+              ':memory:',
+              api_id=32471788,
+              api_hash='cb57130abda56877acf3b3027e569450',
+              bot_token='8942582638:AAF1MQGDLVPqbLxwK3X2RbEeLDYfHzUzp5I',
+          )
+          app.start()
+          print('SESSION_STRING_START')
+          print(app.export_session_string())
+          print('SESSION_STRING_END')
+          app.stop()
+          "
