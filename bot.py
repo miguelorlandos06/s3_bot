@@ -323,7 +323,7 @@ async def subir_a_s3(temp_path, filename, size, on_progress=None):
 
     async with _s3_session.client("s3", endpoint_url=S3_ENDPOINT, aws_access_key_id="public", aws_secret_access_key="public", region_name=S3_REGION, config=_S3_CONFIG) as s3:
         with open(temp_path, "rb") as f:
-            await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"Content-Type": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
+            await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"ContentType": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
 
 
