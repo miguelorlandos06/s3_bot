@@ -3,20 +3,21 @@ name: Bot
 on:
   workflow_dispatch:
   schedule:
-    # Relanzar cada 5 horas para evitar el límite de 6h
-    - cron: '0 */5 * * *'
+    - cron: '*/5 * * * *'
+
+concurrency:
+  group: todus-bot
+  cancel-in-progress: true
 
 jobs:
   run-bot:
     runs-on: ubuntu-latest
-    timeout-minutes: 350
+    timeout-minutes: 7
 
     steps:
-      - name: Checkout
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
+      - uses: actions/setup-python@v5
         with:
           python-version-file: '.python-version'
 
