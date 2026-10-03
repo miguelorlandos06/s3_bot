@@ -1,4 +1,4 @@
-"""Bot de subida a Todus S3 - GitHub Actions Runner."""
+"""Bot de subida a Todus S3 - GitHub Actions Runner (optimizado)."""
 import os, re, time, uuid, signal, asyncio, logging
 from urllib.parse import urlparse, unquote, quote
 
@@ -10,6 +10,10 @@ from boto3.s3.transfer import TransferConfig
 
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
+
+# ============================================================
+# Configuración
+# ============================================================
 
 BOT_TOKEN = "8942582638:AAF1MQGDLVPqbLxwK3X2RbEeLDYfHzUzp5I"
 API_ID = 32471788
@@ -25,29 +29,47 @@ DOWNLOAD_PATH = "/tmp/todus_uploads"
 PORT = 10000
 
 MAX_FILE_SIZE = 2000 * 1024 * 1024
-QUEUE_WORKERS = 2
-CHUNK_SIZE = 4 * 1024 * 1024
+QUEUE_WORKERS = 1
+CHUNK_SIZE = 16 * 1024 * 1024
 POSITION_POLL_INTERVAL = 3
 WATCHDOG_LIFETIME = 14100
+PARALLEL_URL_DOWNLOAD = True
+PARALLEL_URL_PARTS = 4
+PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
+
+# Headers para URLs que requieren navegador (UCLV, etc.)
+BROWSER_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "none",
+    "Upgrade-Insecure-Requests": "1",
+}
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(name)s - %(message)s")
+logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
+logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-app = Client("todus_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=SESSION_STRING, in_memory=True, workers=4)
+app = Client("todus_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=SESSION_STRING, in_memory=True, workers=8, sleep_threshold=60)
 
 _S3_CONFIG = BotoConfig(
     signature_version=UNSIGNED,
     retries={"max_attempts": 3, "mode": "adaptive"},
-    max_pool_connections=20,
+    max_pool_connections=50,
     connect_timeout=30,
     read_timeout=600,
+    s3={"addressing_style": "path"},
 )
 _TRANSFER_CONFIG = TransferConfig(
-    multipart_threshold=8*1024*1024,
-    multipart_chunksize=32*1024*1024,
-    max_concurrency=8,
+    multipart_threshold=8 * 1024 * 1024,
+    multipart_chunksize=64 * 1024 * 1024,
+    max_concurrency=16,
     use_threads=True,
 )
 _s3_session = aioboto3.Session()
@@ -301,7 +323,7 @@ async def subir_a_s3(temp_path, filename, size, on_progress=None):
 
     async with _s3_session.client("s3", endpoint_url=S3_ENDPOINT, aws_access_key_id="public", aws_secret_access_key="public", region_name=S3_REGION, config=_S3_CONFIG) as s3:
         with open(temp_path, "rb") as f:
-            await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"ContentType": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
+            await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"Content-Type": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
 
 
@@ -312,6 +334,76 @@ async def process_job(job):
         await _process_file(job)
 
 
+async def _download_sequential(session, url, temp_path, total, job):
+    downloaded = 0
+    last_pct = -1
+    async with aiofiles.open(temp_path, "wb") as f:
+        async with session.get(url, headers=BROWSER_HEADERS) as resp:
+            if resp.status >= 400:
+                raise RuntimeError(f"HTTP {resp.status}")
+            async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                await f.write(chunk)
+                downloaded += len(chunk)
+                if downloaded > MAX_FILE_SIZE:
+                    raise RuntimeError("Archivo supera el límite")
+                if total:
+                    pct = int(downloaded / total * 100)
+                    if pct - last_pct >= 5 or pct == 100:
+                        last_pct = pct
+                        await edit_status(app, job.chat_id, job.msg_id,
+                            f"┎ DOWNLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(downloaded)}/{format_size(total)}")
+    return downloaded
+
+
+async def _download_parallel(session, url, temp_path, total, job):
+    n_parts = PARALLEL_URL_PARTS
+    part_size = total // n_parts
+    parts = []
+    for i in range(n_parts):
+        start = i * part_size
+        end = start + part_size - 1 if i < n_parts - 1 else total - 1
+        parts.append((i, start, end))
+
+    progress = {"total": 0}
+    progress_lock = asyncio.Lock()
+    last_pct = [-1]
+
+    async def download_part(idx, start, end):
+        path = f"{temp_path}.part{idx}"
+        headers = dict(BROWSER_HEADERS)
+        headers["Range"] = f"bytes={start}-{end}"
+        async with session.get(url, headers=headers) as resp:
+            if resp.status not in (200, 206):
+                raise RuntimeError(f"HTTP {resp.status} en parte {idx}")
+            async with aiofiles.open(path, "wb") as f:
+                async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
+                    await f.write(chunk)
+                    async with progress_lock:
+                        progress["total"] += len(chunk)
+                        pct = int(progress["total"] / total * 100)
+                        if pct - last_pct[0] >= 5 or pct == 100:
+                            last_pct[0] = pct
+                            await edit_status(app, job.chat_id, job.msg_id,
+                                f"┎ DOWNLOADING (parallel x{n_parts})\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(progress['total'])}/{format_size(total)}")
+        return path
+
+    part_paths = await asyncio.gather(*[download_part(i, s, e) for i, s, e in parts])
+
+    async with aiofiles.open(temp_path, "wb") as out:
+        for p in part_paths:
+            async with aiofiles.open(p, "rb") as src:
+                while True:
+                    chunk = await src.read(8 * 1024 * 1024)
+                    if not chunk:
+                        break
+                    await out.write(chunk)
+            try:
+                os.unlink(p)
+            except Exception:
+                pass
+    return total
+
+
 async def _process_url(job):
     url = job.url
     filename = sanitize_filename(get_filename_from_url(url) or f"file_{int(time.time())}")
@@ -320,27 +412,26 @@ async def _process_url(job):
     try:
         check_disk_space()
         async with aiohttp.ClientSession() as session:
-            async with asyncio.timeout(180):
-                async with session.get(url, headers={"User-Agent": "Mozilla/5.0"}) as resp:
-                    if resp.status >= 400:
-                        raise RuntimeError(f"HTTP {resp.status}")
-                    total = int(resp.headers.get("Content-Length", 0))
-                    if total and total > MAX_FILE_SIZE:
-                        raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
-                    downloaded = 0
-                    last_pct = -1
-                    async with aiofiles.open(temp_path, "wb") as f:
-                        async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
-                            await f.write(chunk)
-                            downloaded += len(chunk)
-                            if downloaded > MAX_FILE_SIZE:
-                                raise RuntimeError("Archivo supera el límite")
-                            if total:
-                                pct = int(downloaded / total * 100)
-                                if pct - last_pct >= 5 or pct == 100:
-                                    last_pct = pct
-                                    await edit_status(app, job.chat_id, job.msg_id,
-                                        f"┎ DOWNLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(downloaded)}/{format_size(total)}")
+            async with asyncio.timeout(1200):
+                # HEAD para ver tamaño y soporte de Range
+                total = 0
+                accepts_ranges = False
+                try:
+                    async with session.head(url, headers=BROWSER_HEADERS) as h:
+                        if h.status < 400:
+                            total = int(h.headers.get("Content-Length", 0))
+                            accepts_ranges = h.headers.get("Accept-Ranges", "").lower() == "bytes"
+                except Exception:
+                    pass
+
+                if total and total > MAX_FILE_SIZE:
+                    raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
+
+                if PARALLEL_URL_DOWNLOAD and accepts_ranges and total >= PARALLEL_URL_MIN_SIZE:
+                    downloaded = await _download_parallel(session, url, temp_path, total, job)
+                else:
+                    downloaded = await _download_sequential(session, url, temp_path, total, job)
+
         size = os.path.getsize(temp_path)
         await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
 
@@ -371,6 +462,13 @@ async def _process_url(job):
             os.unlink(temp_path)
         except Exception:
             pass
+        # Limpiar partes huérfanas
+        for f in os.listdir(DOWNLOAD_PATH):
+            if f.startswith(os.path.basename(temp_path) + ".part"):
+                try:
+                    os.unlink(os.path.join(DOWNLOAD_PATH, f))
+                except Exception:
+                    pass
 
 
 async def _process_file(job):
@@ -577,7 +675,7 @@ async def main():
     await app.start()
     job_queue.start_workers(process_job)
     asyncio.create_task(watchdog())
-    log.info(f"BOT READY — {QUEUE_WORKERS} workers, límite {format_size(MAX_FILE_SIZE)}, watchdog {WATCHDOG_LIFETIME}s")
+    log.info(f"BOT READY — {QUEUE_WORKERS} workers, límite {format_size(MAX_FILE_SIZE)}, watchdog {WATCHDOG_LIFETIME}s, parallel={PARALLEL_URL_DOWNLOAD}")
     try:
         await asyncio.Event().wait()
     finally:
