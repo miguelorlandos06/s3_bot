@@ -11,7 +11,7 @@ from boto3.s3.transfer import TransferConfig
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = "8942582638:AAF1MQGDLVPqbLxwK3X2RbEeLDYfHzUzp5I"
+BOT_TOKEN = "8841683556:AAG0Mfrk-hBIFfSXUSKo8N2YCe4b5Ugmg44"
 API_ID = 32471788
 API_HASH = "cb57130abda56877acf3b3027e569450"
 SESSION_STRING = "AQHveuwAPk0BamvGx-dy5Pcjdb2SIDb3X7s3_I_4oAU_RxpIBUGlosFneW1vLda-h3NMA2D3aySDim-jW-Ia-WoRR-YDBXqjFQbjxNyI8N4Ef1DsrJlzCk9DZ589Zv5ofQlpj4naGw55fKvurfbuWwCeShPUq0pXB_XgE75JU8xBksABzCGbETKPtYDqgo-0Gblgs9anR5dS1SwWCkInygsPvKSgpYSrs2FicOJhvTVZBiUt_5oSZQ4xRty6WBtSmtaBnMV7jOJrWV3IYu6zyvd_JhopmZLPYpxFkcnQhzsfQTEGP4kebDPZBUzMNyOMTzh3WgiDM6QEjmiliGCzmUiORq7qBAAAAAIVBPtuAQ"
