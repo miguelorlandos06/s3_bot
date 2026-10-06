@@ -340,7 +340,7 @@ async def subir_a_catbox(temp_path, filename):
         form.add_field("reqtype", "fileupload")
         with open(temp_path, "rb") as f:
             form.add_field("fileToUpload", f, filename=filename)
-            async with session.post(CATBOX_URL, data=form, timeout=600) as resp:
+            async with session.post(CATBOX_URL, data=form, timeout=600, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}) as resp:
                 text = (await resp.text()).strip()
                 if resp.status != 200 or not text.startswith("http"):
                     raise RuntimeError(f"Catbox error {resp.status}: {text[:200]}")
