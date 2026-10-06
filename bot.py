@@ -1,4 +1,3 @@
-"""Bot de subida a Todus S3 / Catbox / Litterbox - GitHub Actions Runner."""
 import os, re, time, uuid, signal, asyncio, logging
 from urllib.parse import urlparse, unquote, quote
 
@@ -569,7 +568,6 @@ async def cmd_start(client, message):
         "Envíame un enlace o un archivo (máx 2 GB).\n"
         "Elige entre:\n"
         "📦 toDus S3 · 2GB · Permanente\n"
-        "🐱 Catbox · 200MB · Permanente\n"
         "⏳ Litterbox · 1GB · Temporal\n\n"
         "**Comandos:**\n• /start — este mensaje\n• /cancel — cancelar tu trabajo\n• /status — ver tu posición en la cola")
 
