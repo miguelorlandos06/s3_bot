@@ -19,7 +19,6 @@ SESSION_STRING = "AQHveuwAhm_coB6aOz5_HzsaDV6hLPJ4CX-YbsDZmuWzse4xZKz-Ae-8IxekF2
 S3_ENDPOINT = "https://s3.todus.cu"
 S3_BUCKET = "stream"
 S3_REGION = "us-east-1"
-CATBOX_URL = "https://catbox.moe/user/api.php"
 LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 
 DOWNLOAD_PATH = "/tmp/todus_uploads"
@@ -33,7 +32,6 @@ PARALLEL_URL_DOWNLOAD = True
 PARALLEL_URL_PARTS = 4
 PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
 
-CATBOX_MAX = 200 * 1024 * 1024
 LITTERBOX_MAX = 1024 * 1024 * 1024
 TODUS_MAX = 2000 * 1024 * 1024
 BANNED_EXTENSIONS = {".exe", ".scr", ".cpl", ".jar", ".doc", ".docx", ".docm"}
@@ -328,24 +326,6 @@ async def subir_a_s3(temp_path, filename, size, on_progress=None):
             await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"ContentType": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
 
-async def subir_a_catbox(temp_path, filename):
-    ext = os.path.splitext(filename)[1].lower()
-    if ext in BANNED_EXTENSIONS:
-        raise RuntimeError(f"Extensión no permitida en Catbox: {ext}")
-    size = os.path.getsize(temp_path)
-    if size > CATBOX_MAX:
-        raise RuntimeError(f"Archivo {format_size(size)} supera el límite de Catbox (200 MB)")
-    async with aiohttp.ClientSession() as session:
-        form = aiohttp.FormData()
-        form.add_field("reqtype", "fileupload")
-        with open(temp_path, "rb") as f:
-            form.add_field("fileToUpload", f, filename=filename)
-            async with session.post(CATBOX_URL, data=form, timeout=600, headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"}) as resp:
-                text = (await resp.text()).strip()
-                if resp.status != 200 or not text.startswith("http"):
-                    raise RuntimeError(f"Catbox error {resp.status}: {text[:200]}")
-                return text
-
 async def subir_a_litterbox(temp_path, filename, duration="72h"):
     ext = os.path.splitext(filename)[1].lower()
     if ext in BANNED_EXTENSIONS:
@@ -452,8 +432,6 @@ async def _ask_cloud(job, temp_path, filename, size):
     buttons = []
     if size <= TODUS_MAX:
         buttons.append([InlineKeyboardButton("📦 toDus S3 · 2GB · Permanente", callback_data=f"cloud:todus:{uid}")])
-    if size <= CATBOX_MAX:
-        buttons.append([InlineKeyboardButton("🐱 Catbox · 200MB · Permanente", callback_data=f"cloud:catbox:{uid}")])
     if size <= LITTERBOX_MAX:
         buttons.append([InlineKeyboardButton("⏳ Litterbox · 1GB · Temporal", callback_data=f"cloud:litterbox:{uid}")])
     await app.edit_message_text(
@@ -556,9 +534,6 @@ async def _do_upload(chat_id, msg_id, uid):
                     f"┎ UPLOADING → toDus S3\n┠ [{progress_bar(pct)}]\n┠ {pct}%\n┖ {format_size(sent)}/{format_size(total)}")
             url = await subir_a_s3(temp_path, filename, size, on_up)
             cloud_label = "toDus S3"
-        elif cloud == "catbox":
-            url = await subir_a_catbox(temp_path, filename)
-            cloud_label = "Catbox"
         elif cloud == "litterbox":
             duration = pending.get("duration", "72h")
             url = await subir_a_litterbox(temp_path, filename, duration)
