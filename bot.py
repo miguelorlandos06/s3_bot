@@ -11,10 +11,10 @@ from boto3.s3.transfer import TransferConfig
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-BOT_TOKEN = "8841683556:AAG0Mfrk-hBIFfSXUSKo8N2YCe4b5Ugmg44"
-API_ID = 32471788
-API_HASH = "cb57130abda56877acf3b3027e569450"
-SESSION_STRING = "AQHveuwAhm_coB6aOz5_HzsaDV6hLPJ4CX-YbsDZmuWzse4xZKz-Ae-8IxekF27LrffzblZmgGj8izLQF_FXnAGR9_UTMNpzMBVL-XiCDg10D01-HI288lnOQOYRdorgqrwd5fYXdZImejgA80DEPL8__MAVe_9QGa5xp3d3bCaJonmNTkMULid85oPn-9B9to7Fp0qrwVSq_bIJZKRLPVfX8dl1Pzv9btNlIwKt3pKBSkU1K6b_UzfFQtZwVqyROeVP3VTChtoEF_cifSMyrel0A46RkJWDAMwGJLjgdZk7dn7G7EmBhDbP-75sxnTHxH0A6XYbz0HkatRX4GpKiym_c9iQMwAAAAIPAWJkAQ"
+BOT_TOKEN = os.environ["BOT_TOKEN"]
+API_ID = int(os.environ["API_ID"])
+API_HASH = os.environ["API_HASH"]
+SESSION_STRING = os.environ["SESSION_STRING"]
 
 S3_ENDPOINT = "https://s3.todus.cu"
 S3_BUCKET = "stream"
