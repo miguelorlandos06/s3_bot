@@ -1,4 +1,4 @@
-"""Bot de subida a Todus S3 - GitHub Actions Runner (optimizado)."""
+"""Bot de subida a Todus S3 / Catbox / Litterbox - GitHub Actions Runner."""
 import os, re, time, uuid, signal, asyncio, logging
 from urllib.parse import urlparse, unquote, quote
 
@@ -11,23 +11,19 @@ from boto3.s3.transfer import TransferConfig
 from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 
-# ============================================================
-# Configuración
-# ============================================================
-
 BOT_TOKEN = "8942582638:AAF1MQGDLVPqbLxwK3X2RbEeLDYfHzUzp5I"
 API_ID = 32471788
 API_HASH = "cb57130abda56877acf3b3027e569450"
-
 SESSION_STRING = "AQHveuwAPk0BamvGx-dy5Pcjdb2SIDb3X7s3_I_4oAU_RxpIBUGlosFneW1vLda-h3NMA2D3aySDim-jW-Ia-WoRR-YDBXqjFQbjxNyI8N4Ef1DsrJlzCk9DZ589Zv5ofQlpj4naGw55fKvurfbuWwCeShPUq0pXB_XgE75JU8xBksABzCGbETKPtYDqgo-0Gblgs9anR5dS1SwWCkInygsPvKSgpYSrs2FicOJhvTVZBiUt_5oSZQ4xRty6WBtSmtaBnMV7jOJrWV3IYu6zyvd_JhopmZLPYpxFkcnQhzsfQTEGP4kebDPZBUzMNyOMTzh3WgiDM6QEjmiliGCzmUiORq7qBAAAAAIVBPtuAQ"
 
 S3_ENDPOINT = "https://s3.todus.cu"
 S3_BUCKET = "stream"
 S3_REGION = "us-east-1"
+CATBOX_URL = "https://catbox.moe/user/api.php"
+LITTERBOX_URL = "https://litterbox.catbox.moe/resources/internals/api.php"
 
 DOWNLOAD_PATH = "/tmp/todus_uploads"
 PORT = 10000
-
 MAX_FILE_SIZE = 2000 * 1024 * 1024
 QUEUE_WORKERS = 1
 CHUNK_SIZE = 16 * 1024 * 1024
@@ -37,7 +33,11 @@ PARALLEL_URL_DOWNLOAD = True
 PARALLEL_URL_PARTS = 4
 PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
 
-# Headers para URLs que requieren navegador (UCLV, etc.)
+CATBOX_MAX = 200 * 1024 * 1024
+LITTERBOX_MAX = 1024 * 1024 * 1024
+TODUS_MAX = 2000 * 1024 * 1024
+BANNED_EXTENSIONS = {".exe", ".scr", ".cpl", ".jar", ".doc", ".docx", ".docm"}
+
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
@@ -74,6 +74,7 @@ _TRANSFER_CONFIG = TransferConfig(
 )
 _s3_session = aioboto3.Session()
 
+_pending_cloud = {}
 
 class QueuedJob:
     __slots__ = ("job_id","user_id","chat_id","msg_id","kind","url","original_name","original_msg_id","task","created_at","cancel_requested")
@@ -89,7 +90,6 @@ class QueuedJob:
         self.task = None
         self.created_at = time.time()
         self.cancel_requested = False
-
 
 class JobQueue:
     def __init__(self, n_workers):
@@ -164,6 +164,7 @@ class JobQueue:
         for i in range(self.n_workers):
             self.workers.append(asyncio.create_task(self._worker_loop(i, process_fn)))
         self.workers.append(asyncio.create_task(self._notify_position_changes()))
+        self.workers.append(asyncio.create_task(self._cleanup_pending()))
 
     async def _worker_loop(self, worker_id, process_fn):
         while True:
@@ -216,6 +217,19 @@ class JobQueue:
                 log.exception(f"_notify_position_changes: {e}")
             await asyncio.sleep(POSITION_POLL_INTERVAL)
 
+    async def _cleanup_pending(self):
+        while True:
+            await asyncio.sleep(300)
+            now = time.time()
+            expired = [uid for uid, p in _pending_cloud.items() if now - p.get("created_at", 0) > 600]
+            for uid in expired:
+                p = _pending_cloud.pop(uid, None)
+                if p:
+                    try:
+                        os.unlink(p["temp_path"])
+                    except Exception:
+                        pass
+
     async def stop_workers(self):
         for w in self.workers:
             w.cancel()
@@ -226,9 +240,7 @@ class JobQueue:
                 pass
         self.workers.clear()
 
-
 job_queue = JobQueue(QUEUE_WORKERS)
-
 
 def format_size(b):
     if b < 1024: return f"{b} B"
@@ -236,14 +248,11 @@ def format_size(b):
     if b < 1073741824: return f"{b / 1048576:.1f} MB"
     return f"{b / 1073741824:.2f} GB"
 
-
 def progress_bar(p):
     filled = round(15 * p / 100)
     return "⬢" * filled + "⬡" * (15 - filled)
 
-
 URL_RE = re.compile(r"(https?://[^\s<>\"']+?)(?=[.,;:!?)\]]?(\s|$))", re.IGNORECASE)
-
 
 def get_filename_from_url(url):
     try:
@@ -254,12 +263,10 @@ def get_filename_from_url(url):
         pass
     return None
 
-
 def sanitize_filename(name):
     name = name.replace("/", "_").replace("\\", "_")
     name = re.sub(r"[\s?#&]+", "_", name)
     return name.strip("._") or f"file_{int(time.time())}"
-
 
 def check_disk_space():
     st = os.statvfs(DOWNLOAD_PATH)
@@ -268,12 +275,10 @@ def check_disk_space():
     if free < min_free:
         raise RuntimeError(f"Disco insuficiente: {format_size(free)} libres")
 
-
 def cancel_button(uid):
     return InlineKeyboardMarkup([[
         InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{uid}")
     ]])
-
 
 class EditState:
     def __init__(self):
@@ -282,7 +287,6 @@ class EditState:
 
 _edit_states = {}
 _edit_locks = {}
-
 
 async def edit_status(client, chat_id, msg_id, text, force=False):
     state = _edit_states.setdefault(chat_id, EditState())
@@ -300,13 +304,11 @@ async def edit_status(client, chat_id, msg_id, text, force=False):
         except Exception:
             pass
 
-
 async def notify_processing(job):
     try:
         await app.edit_message_text(job.chat_id, job.msg_id, "▶️ Procesando...", reply_markup=cancel_button(job.user_id))
     except Exception:
         pass
-
 
 async def subir_a_s3(temp_path, filename, size, on_progress=None):
     safe_name = sanitize_filename(filename)
@@ -326,13 +328,48 @@ async def subir_a_s3(temp_path, filename, size, on_progress=None):
             await s3.upload_fileobj(f, S3_BUCKET, remote_key, ExtraArgs={"ContentType": "application/octet-stream"}, Config=_TRANSFER_CONFIG, Callback=_progress_callback)
     return f"{S3_ENDPOINT}/{S3_BUCKET}/{quote(remote_key)}"
 
+async def subir_a_catbox(temp_path, filename):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in BANNED_EXTENSIONS:
+        raise RuntimeError(f"Extensión no permitida en Catbox: {ext}")
+    size = os.path.getsize(temp_path)
+    if size > CATBOX_MAX:
+        raise RuntimeError(f"Archivo {format_size(size)} supera el límite de Catbox (200 MB)")
+    async with aiohttp.ClientSession() as session:
+        form = aiohttp.FormData()
+        form.add_field("reqtype", "fileupload")
+        with open(temp_path, "rb") as f:
+            form.add_field("fileToUpload", f, filename=filename)
+            async with session.post(CATBOX_URL, data=form, timeout=600) as resp:
+                text = (await resp.text()).strip()
+                if resp.status != 200 or not text.startswith("http"):
+                    raise RuntimeError(f"Catbox error {resp.status}: {text[:200]}")
+                return text
+
+async def subir_a_litterbox(temp_path, filename, duration="72h"):
+    ext = os.path.splitext(filename)[1].lower()
+    if ext in BANNED_EXTENSIONS:
+        raise RuntimeError(f"Extensión no permitida en Litterbox: {ext}")
+    size = os.path.getsize(temp_path)
+    if size > LITTERBOX_MAX:
+        raise RuntimeError(f"Archivo {format_size(size)} supera el límite de Litterbox (1 GB)")
+    async with aiohttp.ClientSession() as session:
+        form = aiohttp.FormData()
+        form.add_field("reqtype", "fileupload")
+        form.add_field("time", duration)
+        with open(temp_path, "rb") as f:
+            form.add_field("fileToUpload", f, filename=filename)
+            async with session.post(LITTERBOX_URL, data=form, timeout=600) as resp:
+                text = (await resp.text()).strip()
+                if resp.status != 200 or not text.startswith("http"):
+                    raise RuntimeError(f"Litterbox error {resp.status}: {text[:200]}")
+                return text
 
 async def process_job(job):
     if job.kind == "url":
         await _process_url(job)
     else:
         await _process_file(job)
-
 
 async def _download_sequential(session, url, temp_path, total, job):
     downloaded = 0
@@ -354,7 +391,6 @@ async def _download_sequential(session, url, temp_path, total, job):
                             f"┎ DOWNLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(downloaded)}/{format_size(total)}")
     return downloaded
 
-
 async def _download_parallel(session, url, temp_path, total, job):
     n_parts = PARALLEL_URL_PARTS
     part_size = total // n_parts
@@ -363,7 +399,6 @@ async def _download_parallel(session, url, temp_path, total, job):
         start = i * part_size
         end = start + part_size - 1 if i < n_parts - 1 else total - 1
         parts.append((i, start, end))
-
     progress = {"total": 0}
     progress_lock = asyncio.Lock()
     last_pct = [-1]
@@ -388,7 +423,6 @@ async def _download_parallel(session, url, temp_path, total, job):
         return path
 
     part_paths = await asyncio.gather(*[download_part(i, s, e) for i, s, e in parts])
-
     async with aiofiles.open(temp_path, "wb") as out:
         for p in part_paths:
             async with aiofiles.open(p, "rb") as src:
@@ -403,6 +437,30 @@ async def _download_parallel(session, url, temp_path, total, job):
                 pass
     return total
 
+async def _ask_cloud(job, temp_path, filename, size):
+    uid = job.user_id
+    _pending_cloud[uid] = {
+        "job": job,
+        "temp_path": temp_path,
+        "filename": filename,
+        "size": size,
+        "chat_id": job.chat_id,
+        "msg_id": job.msg_id,
+        "stage": "cloud",
+        "created_at": time.time(),
+    }
+    buttons = []
+    if size <= TODUS_MAX:
+        buttons.append([InlineKeyboardButton("📦 toDus S3 · 2GB · Permanente", callback_data=f"cloud:todus:{uid}")])
+    if size <= CATBOX_MAX:
+        buttons.append([InlineKeyboardButton("🐱 Catbox · 200MB · Permanente", callback_data=f"cloud:catbox:{uid}")])
+    if size <= LITTERBOX_MAX:
+        buttons.append([InlineKeyboardButton("⏳ Litterbox · 1GB · Temporal", callback_data=f"cloud:litterbox:{uid}")])
+    await app.edit_message_text(
+        job.chat_id, job.msg_id,
+        f"┎ ✅ DESCARGA COMPLETA\n┠ SIZE: {format_size(size)}\n┖ Elige la nube:",
+        reply_markup=InlineKeyboardMarkup(buttons),
+    )
 
 async def _process_url(job):
     url = job.url
@@ -413,7 +471,6 @@ async def _process_url(job):
         check_disk_space()
         async with aiohttp.ClientSession() as session:
             async with asyncio.timeout(1200):
-                # HEAD para ver tamaño y soporte de Range
                 total = 0
                 accepts_ranges = False
                 try:
@@ -423,28 +480,14 @@ async def _process_url(job):
                             accepts_ranges = h.headers.get("Accept-Ranges", "").lower() == "bytes"
                 except Exception:
                     pass
-
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
-
                 if PARALLEL_URL_DOWNLOAD and accepts_ranges and total >= PARALLEL_URL_MIN_SIZE:
-                    downloaded = await _download_parallel(session, url, temp_path, total, job)
+                    await _download_parallel(session, url, temp_path, total, job)
                 else:
-                    downloaded = await _download_sequential(session, url, temp_path, total, job)
-
+                    await _download_sequential(session, url, temp_path, total, job)
         size = os.path.getsize(temp_path)
-        await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
-
-        async def on_up(sent, total):
-            pct = int(sent / total * 100) if total else 0
-            await edit_status(app, job.chat_id, job.msg_id,
-                f"┎ UPLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(sent)}/{format_size(total)}")
-
-        upload_url = await subir_a_s3(temp_path, filename, size, on_up)
-        name = os.path.splitext(filename)[0].replace("_", " ")
-        await app.edit_message_text(job.chat_id, job.msg_id,
-            f"┎ NAME: {name}\n┠ EXTENSION: {ext.replace('.', '')}\n┠ SIZE: {format_size(size)}\n┖ URL: {upload_url}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 DESCARGAR", url=upload_url)]]))
+        await _ask_cloud(job, temp_path, filename, size)
     except asyncio.CancelledError:
         try:
             await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
@@ -457,19 +500,10 @@ async def _process_url(job):
             await app.edit_message_text(job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}")
         except Exception:
             pass
-    finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
-        # Limpiar partes huérfanas
-        for f in os.listdir(DOWNLOAD_PATH):
-            if f.startswith(os.path.basename(temp_path) + ".part"):
-                try:
-                    os.unlink(os.path.join(DOWNLOAD_PATH, f))
-                except Exception:
-                    pass
-
 
 async def _process_file(job):
     original_name = sanitize_filename(job.original_name or f"file_{int(time.time())}")
@@ -487,18 +521,7 @@ async def _process_file(job):
         original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
         await original_msg.download(file_name=temp_path, progress=on_dl)
         size = os.path.getsize(temp_path)
-        await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
-
-        async def on_up(sent, total):
-            pct = int(sent / total * 100) if total else 0
-            await edit_status(app, job.chat_id, job.msg_id,
-                f"┎ UPLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(sent)}/{format_size(total)}")
-
-        upload_url = await subir_a_s3(temp_path, original_name, size, on_up)
-        name = os.path.splitext(original_name)[0].replace("_", " ")
-        await app.edit_message_text(job.chat_id, job.msg_id,
-            f"┎ NAME: {name}\n┠ EXTENSION: {ext.replace('.', '')}\n┠ SIZE: {format_size(size)}\n┖ URL: {upload_url}",
-            reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("📥 DESCARGAR", url=upload_url)]]))
+        await _ask_cloud(job, temp_path, original_name, size)
     except asyncio.CancelledError:
         try:
             await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
@@ -511,25 +534,81 @@ async def _process_file(job):
             await app.edit_message_text(job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}")
         except Exception:
             pass
-    finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
 
+async def _do_upload(chat_id, msg_id, uid):
+    pending = _pending_cloud.get(uid)
+    if not pending:
+        return
+    temp_path = pending["temp_path"]
+    filename = pending["filename"]
+    size = pending["size"]
+    cloud = pending.get("cloud")
+    try:
+        await edit_status(app, chat_id, msg_id, "UPLOADING...", force=True)
+        if cloud == "todus":
+            async def on_up(sent, total):
+                pct = int(sent / total * 100) if total else 0
+                await edit_status(app, chat_id, msg_id,
+                    f"┎ UPLOADING → toDus S3\n┠ [{progress_bar(pct)}]\n┠ {pct}%\n┖ {format_size(sent)}/{format_size(total)}")
+            url = await subir_a_s3(temp_path, filename, size, on_up)
+            cloud_label = "toDus S3"
+        elif cloud == "catbox":
+            url = await subir_a_catbox(temp_path, filename)
+            cloud_label = "Catbox"
+        elif cloud == "litterbox":
+            duration = pending.get("duration", "72h")
+            url = await subir_a_litterbox(temp_path, filename, duration)
+            cloud_label = f"Litterbox ({duration})"
+        else:
+            raise RuntimeError("Nube desconocida")
+        name = os.path.splitext(filename)[0].replace("_", " ")
+        ext = os.path.splitext(filename)[1].replace(".", "")
+        await app.edit_message_text(
+            chat_id, msg_id,
+            f"┎ NAME: {name}\n┠ EXTENSION: {ext}\n┠ SIZE: {format_size(size)}\n┠ CLOUD: {cloud_label}\n┖ URL: {url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 DESCARGAR", url=url)
+            ]]),
+        )
+    except Exception as e:
+        log.exception("error subiendo")
+        try:
+            await app.edit_message_text(chat_id, msg_id, f"ERROR: {str(e)[:200]}")
+        except Exception:
+            pass
+    finally:
+        _pending_cloud.pop(uid, None)
+        try:
+            os.unlink(temp_path)
+        except Exception:
+            pass
 
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
     await message.reply_text(
-        "**Bot de subida a Todus S3**\n\n"
-        f"Envíame un enlace o un archivo (máx {format_size(MAX_FILE_SIZE)}).\n"
-        "El archivo se sube a `s3.todus.cu/stream` y te devuelvo el enlace público.\n\n"
+        "**Bot de subida a múltiples nubes**\n\n"
+        "Envíame un enlace o un archivo (máx 2 GB).\n"
+        "Elige entre:\n"
+        "📦 toDus S3 · 2GB · Permanente\n"
+        "🐱 Catbox · 200MB · Permanente\n"
+        "⏳ Litterbox · 1GB · Temporal\n\n"
         "**Comandos:**\n• /start — este mensaje\n• /cancel — cancelar tu trabajo\n• /status — ver tu posición en la cola")
-
 
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(client, message):
     uid = message.from_user.id
+    if uid in _pending_cloud:
+        p = _pending_cloud.pop(uid)
+        try:
+            os.unlink(p["temp_path"])
+        except Exception:
+            pass
+        await message.reply_text("❌ Selección de nube cancelada.")
+        return
     result = await job_queue.cancel_user(uid)
     if result == "none":
         await message.reply_text("ℹ️ No tienes trabajos activos ni en cola.")
@@ -538,12 +617,23 @@ async def cmd_cancel(client, message):
     else:
         await message.reply_text("✅ Tu trabajo fue removido de la cola.")
 
-
 @app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
 async def on_cancel_callback(client, callback_query):
     uid = int(callback_query.data.split(":")[1])
     if callback_query.from_user.id != uid:
         await callback_query.answer("⛔ Solo el dueño puede cancelar.", show_alert=True)
+        return
+    if uid in _pending_cloud:
+        p = _pending_cloud.pop(uid)
+        try:
+            os.unlink(p["temp_path"])
+        except Exception:
+            pass
+        await callback_query.answer("❌ Cancelado.")
+        try:
+            await callback_query.message.edit_text("❌ CANCELADO")
+        except Exception:
+            pass
         return
     result = await job_queue.cancel_user(uid)
     if result == "none":
@@ -553,10 +643,57 @@ async def on_cancel_callback(client, callback_query):
     else:
         await callback_query.answer("✅ Removido de la cola.")
 
+@app.on_callback_query(filters.regex(r"^cloud:(todus|catbox|litterbox):(\d+)$"))
+async def on_cloud_choice(client, callback_query):
+    match = re.match(r"^cloud:(todus|catbox|litterbox):(\d+)$", callback_query.data)
+    cloud, uid = match.group(1), int(match.group(2))
+    if callback_query.from_user.id != uid:
+        await callback_query.answer("⛔ Solo el dueño puede elegir.", show_alert=True)
+        return
+    pending = _pending_cloud.get(uid)
+    if not pending:
+        await callback_query.answer("⏱️ Sesión expirada.", show_alert=True)
+        return
+    if cloud == "litterbox":
+        pending["stage"] = "time"
+        time_buttons = InlineKeyboardMarkup([
+            [InlineKeyboardButton("1h", callback_data=f"time:1h:{uid}"),
+             InlineKeyboardButton("12h", callback_data=f"time:12h:{uid}")],
+            [InlineKeyboardButton("24h", callback_data=f"time:24h:{uid}"),
+             InlineKeyboardButton("72h", callback_data=f"time:72h:{uid}")],
+        ])
+        await callback_query.message.edit_text(
+            f"⏳ Litterbox — elige duración:\n\n📎 {pending['filename']}\n📊 {format_size(pending['size'])}",
+            reply_markup=time_buttons,
+        )
+        await callback_query.answer()
+        return
+    await callback_query.answer(f"Subiendo a {cloud}...")
+    pending["cloud"] = cloud
+    await _do_upload(pending["chat_id"], pending["msg_id"], uid)
+
+@app.on_callback_query(filters.regex(r"^time:(1h|12h|24h|72h):(\d+)$"))
+async def on_time_choice(client, callback_query):
+    match = re.match(r"^time:(1h|12h|24h|72h):(\d+)$", callback_query.data)
+    duration, uid = match.group(1), int(match.group(2))
+    if callback_query.from_user.id != uid:
+        await callback_query.answer("⛔ Solo el dueño puede elegir.", show_alert=True)
+        return
+    pending = _pending_cloud.get(uid)
+    if not pending:
+        await callback_query.answer("⏱️ Sesión expirada.", show_alert=True)
+        return
+    pending["cloud"] = "litterbox"
+    pending["duration"] = duration
+    await callback_query.answer(f"Subiendo a Litterbox ({duration})...")
+    await _do_upload(pending["chat_id"], pending["msg_id"], uid)
 
 @app.on_message(filters.command("status"))
 async def cmd_status(client, message):
     uid = message.from_user.id
+    if uid in _pending_cloud:
+        await message.reply_text("⏳ Esperando que elijas la nube...")
+        return
     pos = job_queue.position_of(uid)
     tq = job_queue.queued_count
     ta = job_queue.active_count
@@ -569,7 +706,6 @@ async def cmd_status(client, message):
             f"⏳ Posición #{pos} de la cola.\n\n📊 Cola: {tq} esperando, {ta} procesando",
             reply_markup=cancel_button(uid))
 
-
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status"]))
 async def handle_text(client, message):
     uid = message.from_user.id
@@ -577,8 +713,8 @@ async def handle_text(client, message):
     if not match:
         await message.reply_text(f"Envíame un enlace o un archivo (máx {format_size(MAX_FILE_SIZE)}).")
         return
-    if job_queue.has_user_job(uid):
-        await message.reply_text("⚠️ Ya tienes un trabajo en curso o en cola.")
+    if job_queue.has_user_job(uid) or uid in _pending_cloud:
+        await message.reply_text("⚠️ Ya tienes un trabajo en curso o pendiente.")
         return
     url = match.group(1)
     status = await message.reply_text("📥 Añadiendo a la cola...")
@@ -593,7 +729,6 @@ async def handle_text(client, message):
     else:
         await status.edit_text(f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)", reply_markup=cancel_button(uid))
 
-
 @app.on_message(filters.document | filters.video | filters.audio | filters.voice | filters.video_note | filters.animation | filters.sticker | filters.photo)
 async def handle_media(client, message):
     uid = message.from_user.id
@@ -604,8 +739,8 @@ async def handle_media(client, message):
     if file_size and file_size > MAX_FILE_SIZE:
         await message.reply_text(f"❌ Archivo demasiado grande ({format_size(file_size)}).")
         return
-    if job_queue.has_user_job(uid):
-        await message.reply_text("⚠️ Ya tienes un trabajo en curso o en cola.")
+    if job_queue.has_user_job(uid) or uid in _pending_cloud:
+        await message.reply_text("⚠️ Ya tienes un trabajo en curso o pendiente.")
         return
     original_name = getattr(media, "file_name", None)
     if not original_name:
@@ -630,24 +765,19 @@ async def handle_media(client, message):
     else:
         await status.edit_text(f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)", reply_markup=cancel_button(uid))
 
-
 START_TIME = time.time()
 
-
 async def health_handler(request):
-    return web.json_response({"status": "healthy", "uptime": round(time.time() - START_TIME, 1), "queue_queued": job_queue.queued_count, "queue_active": job_queue.active_count})
-
+    return web.json_response({"status": "healthy", "uptime": round(time.time() - START_TIME, 1), "queue_queued": job_queue.queued_count, "queue_active": job_queue.active_count, "pending_cloud": len(_pending_cloud)})
 
 async def root_handler(request):
     return web.json_response({"status": "online"})
-
 
 def make_web_app():
     a = web.Application()
     a.router.add_get("/", root_handler)
     a.router.add_get("/health", health_handler)
     return a
-
 
 async def run_web():
     a = make_web_app()
@@ -656,7 +786,6 @@ async def run_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     return runner
-
 
 async def watchdog():
     while True:
@@ -669,13 +798,12 @@ async def watchdog():
             log.error("watchdog: forzando os._exit")
             os._exit(0)
 
-
 async def main():
     web_runner = await run_web()
     await app.start()
     job_queue.start_workers(process_job)
     asyncio.create_task(watchdog())
-    log.info(f"BOT READY — {QUEUE_WORKERS} workers, límite {format_size(MAX_FILE_SIZE)}, watchdog {WATCHDOG_LIFETIME}s, parallel={PARALLEL_URL_DOWNLOAD}")
+    log.info(f"BOT READY — {QUEUE_WORKERS} workers, límite {format_size(MAX_FILE_SIZE)}, watchdog {WATCHDOG_LIFETIME}s")
     try:
         await asyncio.Event().wait()
     finally:
@@ -684,7 +812,6 @@ async def main():
         await app.stop()
         await web_runner.cleanup()
         log.info("apagado completo")
-
 
 if __name__ == "__main__":
     app.run(main())
