@@ -8,6 +8,10 @@ from pyrogram import Client, filters
 from pyrogram.types import Message, CallbackQuery, InlineKeyboardMarkup, InlineKeyboardButton
 from todus.client import S3Client
 
+# ═══════════════════════════════════════════════════════════
+# CONFIGURACIÓN
+# ═══════════════════════════════════════════════════════════
+
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
@@ -17,10 +21,10 @@ DOWNLOAD_PATH = "/tmp/todus_uploads"
 PORT = 10000
 MAX_FILE_SIZE = 2000 * 1024 * 1024
 QUEUE_WORKERS = 1
-CHUNK_SIZE = 16 * 1024 * 1024
+CHUNK_SIZE = 1024 * 1024
 POSITION_POLL_INTERVAL = 3
 WATCHDOG_LIFETIME = 14100
-PARALLEL_URL_DOWNLOAD = False
+PARALLEL_URL_DOWNLOAD = True
 PARALLEL_URL_PARTS = 4
 PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
 
@@ -28,8 +32,6 @@ BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
     "Accept": "*/*",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
-    "Accept-Encoding": "gzip, deflate, br",
-    "Connection": "keep-alive",
 }
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -39,7 +41,178 @@ logging.getLogger("aiohttp.access").setLevel(logging.WARNING)
 logging.getLogger("pyrogram").setLevel(logging.WARNING)
 log = logging.getLogger("bot")
 
-app = Client("todus_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN, session_string=SESSION_STRING, in_memory=True, workers=8, sleep_threshold=60)
+app = Client("todus_bot", api_id=API_ID, api_hash=API_HASH, bot_token=BOT_TOKEN,
+             session_string=SESSION_STRING, in_memory=True, workers=8, sleep_threshold=60)
+
+# ═══════════════════════════════════════════════════════════
+# UTILIDADES
+# ═══════════════════════════════════════════════════════════
+
+def format_size(b):
+    if b < 1024: return f"{b} B"
+    if b < 1048576: return f"{b / 1024:.1f} KB"
+    if b < 1073741824: return f"{b / 1048576:.1f} MB"
+    return f"{b / 1073741824:.2f} GB"
+
+
+def progress_bar(p, width=15):
+    filled = round(width * p / 100)
+    return "⬢" * filled + "⬡" * (width - filled)
+
+
+def speed_str(bytes_per_sec):
+    if bytes_per_sec < 1024: return f"{bytes_per_sec:.0f} B/s"
+    if bytes_per_sec < 1048576: return f"{bytes_per_sec/1024:.1f} KB/s"
+    return f"{bytes_per_sec/1048576:.1f} MB/s"
+
+
+def eta_str(seconds):
+    if seconds < 60: return f"{int(seconds)}s"
+    if seconds < 3600: return f"{int(seconds//60)}m {int(seconds%60)}s"
+    return f"{int(seconds//3600)}h {int((seconds%3600)//60)}m"
+
+
+class ProgressTracker:
+    def __init__(self):
+        self.start = time.time()
+        self.last_time = self.start
+        self.last_bytes = 0
+        self.speed = 0.0
+
+    def update(self, current, total):
+        now = time.time()
+        dt = now - self.last_time
+        if dt >= 0.5:
+            db = current - self.last_bytes
+            self.speed = db / dt if dt > 0 else 0
+            self.last_time = now
+            self.last_bytes = current
+
+    def get_eta(self, current, total):
+        if self.speed <= 0: return 0
+        return (total - current) / self.speed
+
+    def get_elapsed(self):
+        return time.time() - self.start
+
+
+def build_progress(emoji, phase, current, total, tracker, extra=""):
+    pct = int(current / total * 100) if total else 0
+    tracker.update(current, total)
+    speed = tracker.speed
+    eta = tracker.get_eta(current, total)
+    elapsed = tracker.get_elapsed()
+
+    lines = [
+        f"{emoji} {phase}",
+        f"┠ [{progress_bar(pct)}]",
+        f"┠ PERCENTAGE: {pct}%",
+        f"┠ SIZE: {format_size(current)}/{format_size(total)}",
+    ]
+    if speed > 0:
+        lines.append(f"┠ SPEED: {speed_str(speed)}")
+    if eta > 0:
+        lines.append(f"┠ ETA: {eta_str(eta)}")
+    lines.append(f"┖ ELAPSED: {eta_str(elapsed)}")
+    return "\n".join(lines)
+
+
+URL_RE = re.compile(r"(https?://[^\s<>\"']+?)(?=[.,;:!?)\]]?(\s|$))", re.IGNORECASE)
+
+
+def get_filename_from_url(url):
+    try:
+        name = os.path.basename(urlparse(url).path)
+        if name and len(name) > 2:
+            return unquote(name)
+    except Exception:
+        pass
+    return None
+
+
+def sanitize_filename(name):
+    name = name.replace("/", "_").replace("\\", "_")
+    name = re.sub(r"[\s?#&]+", "_", name)
+    return name.strip("._") or f"file_{int(time.time())}"
+
+
+def check_disk_space():
+    st = os.statvfs(DOWNLOAD_PATH)
+    free = st.f_bavail * st.f_frsize
+    min_free = 2 * 1024 * 1024 * 1024
+    if free < min_free:
+        raise RuntimeError(f"Disco insuficiente: {format_size(free)} libres")
+
+
+def cancel_button(uid):
+    return InlineKeyboardMarkup([[
+        InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{uid}")
+    ]])
+
+
+# ═══════════════════════════════════════════════════════════
+# EDITOR CON THROTTLE
+# ═══════════════════════════════════════════════════════════
+
+class EditState:
+    def __init__(self):
+        self.last_sent = 0.0
+        self.last_text = ""
+
+_edit_states = {}
+_edit_locks = {}
+
+
+async def edit_status(client, chat_id, msg_id, text, force=False):
+    state = _edit_states.setdefault(chat_id, EditState())
+    lock = _edit_locks.setdefault(chat_id, asyncio.Lock())
+    async with lock:
+        now = time.time()
+        if not force and now - state.last_sent < 1.2:
+            return
+        if text == state.last_text and not force:
+            return
+        try:
+            await client.edit_message_text(chat_id, msg_id, text)
+            state.last_sent = now
+            state.last_text = text
+        except Exception:
+            pass
+
+
+async def notify_processing(job):
+    try:
+        await app.edit_message_text(job.chat_id, job.msg_id, "▶️ Procesando...", reply_markup=cancel_button(job.user_id))
+    except Exception:
+        pass
+
+
+# ═══════════════════════════════════════════════════════════
+# SUBIDA A S3
+# ═══════════════════════════════════════════════════════════
+
+async def subir_a_s3(temp_path, filename, size, on_progress=None):
+    safe_name = sanitize_filename(filename)
+    remote_key = f"{uuid.uuid4().hex[:8]}_{safe_name}"
+
+    def _do_upload():
+        with S3Client() as client:
+            result = client.put(temp_path, remote_key, show_progress=False, inline=True)
+            if not result["success"]:
+                raise RuntimeError(result["error"])
+            if on_progress:
+                try:
+                    on_progress(size, size)
+                except Exception:
+                    pass
+            return client.build_url(remote_key)
+
+    return await asyncio.to_thread(_do_upload)
+
+
+# ═══════════════════════════════════════════════════════════
+# JOB QUEUE
+# ═══════════════════════════════════════════════════════════
 
 class QueuedJob:
     __slots__ = ("job_id","user_id","chat_id","msg_id","kind","url","original_name","original_msg_id","task","created_at","cancel_requested")
@@ -55,6 +228,7 @@ class QueuedJob:
         self.task = None
         self.created_at = time.time()
         self.cancel_requested = False
+
 
 class JobQueue:
     def __init__(self, n_workers):
@@ -86,13 +260,10 @@ class JobQueue:
 
     def position_of(self, user_id):
         job = self.user_pending.get(user_id)
-        if job is None:
-            return None
-        if job.job_id in self.active_jobs:
-            return 0
+        if job is None: return None
+        if job.job_id in self.active_jobs: return 0
         for i, queued in enumerate(self.queue._queue):
-            if queued.job_id == job.job_id:
-                return i + 1
+            if queued.job_id == job.job_id: return i + 1
         return None
 
     def has_user_job(self, user_id):
@@ -101,8 +272,7 @@ class JobQueue:
     async def cancel_user(self, user_id):
         async with self._lock:
             job = self.user_pending.get(user_id)
-            if job is None:
-                return "none"
+            if job is None: return "none"
             if job.job_id in self.active_jobs:
                 job.cancel_requested = True
                 task = job.task
@@ -118,12 +288,10 @@ class JobQueue:
             return "queued"
 
     @property
-    def queued_count(self):
-        return self.queue.qsize()
+    def queued_count(self): return self.queue.qsize()
 
     @property
-    def active_count(self):
-        return len(self.active_jobs)
+    def active_count(self): return len(self.active_jobs)
 
     def start_workers(self, process_fn):
         for i in range(self.n_workers):
@@ -134,8 +302,7 @@ class JobQueue:
         while True:
             job = await self.queue.get()
             try:
-                if job.cancel_requested:
-                    continue
+                if job.cancel_requested: continue
                 await self.mark_active(job)
                 await notify_processing(job)
                 job.task = asyncio.create_task(process_fn(job))
@@ -161,11 +328,9 @@ class JobQueue:
                         continue
                     current[job.user_id] = i + 1
                 for uid, pos in current.items():
-                    if last_positions.get(uid) == pos:
-                        continue
+                    if last_positions.get(uid) == pos: continue
                     job = self.user_pending.get(uid)
-                    if not job:
-                        continue
+                    if not job: continue
                     try:
                         await app.edit_message_text(
                             job.chat_id, job.msg_id,
@@ -191,106 +356,20 @@ class JobQueue:
                 pass
         self.workers.clear()
 
+
 job_queue = JobQueue(QUEUE_WORKERS)
 
-def format_size(b):
-    if b < 1024: return f"{b} B"
-    if b < 1048576: return f"{b / 1024:.1f} KB"
-    if b < 1073741824: return f"{b / 1048576:.1f} MB"
-    return f"{b / 1073741824:.2f} GB"
-
-def progress_bar(p):
-    filled = round(15 * p / 100)
-    return "⬢" * filled + "⬡" * (15 - filled)
-
-URL_RE = re.compile(r"(https?://[^\s<>\"']+?)(?=[.,;:!?)\]]?(\s|$))", re.IGNORECASE)
-
-def get_filename_from_url(url):
-    try:
-        name = os.path.basename(urlparse(url).path)
-        if name and len(name) > 2:
-            return unquote(name)
-    except Exception:
-        pass
-    return None
-
-def sanitize_filename(name):
-    name = name.replace("/", "_").replace("\\", "_")
-    name = re.sub(r"[\s?#&]+", "_", name)
-    return name.strip("._") or f"file_{int(time.time())}"
-
-def check_disk_space():
-    st = os.statvfs(DOWNLOAD_PATH)
-    free = st.f_bavail * st.f_frsize
-    min_free = 2 * 1024 * 1024 * 1024
-    if free < min_free:
-        raise RuntimeError(f"Disco insuficiente: {format_size(free)} libres")
-
-def cancel_button(uid):
-    return InlineKeyboardMarkup([[
-        InlineKeyboardButton("❌ Cancelar", callback_data=f"cancel:{uid}")
-    ]])
-
-class EditState:
-    def __init__(self):
-        self.last_sent = 0.0
-        self.last_text = ""
-
-_edit_states = {}
-_edit_locks = {}
-
-async def edit_status(client, chat_id, msg_id, text, force=False):
-    state = _edit_states.setdefault(chat_id, EditState())
-    lock = _edit_locks.setdefault(chat_id, asyncio.Lock())
-    async with lock:
-        now = time.time()
-        if not force and now - state.last_sent < 1.2:
-            return
-        if text == state.last_text and not force:
-            return
-        try:
-            await client.edit_message_text(chat_id, msg_id, text)
-            state.last_sent = now
-            state.last_text = text
-        except Exception:
-            pass
-
-async def notify_processing(job):
-    try:
-        await app.edit_message_text(job.chat_id, job.msg_id, "▶️ Procesando...", reply_markup=cancel_button(job.user_id))
-    except Exception:
-        pass
-
-async def subir_a_s3(temp_path, filename, size, on_progress=None):
-    safe_name = sanitize_filename(filename)
-    remote_key = f"{uuid.uuid4().hex[:8]}_{safe_name}"
-
-    def _do_upload():
-        with S3Client() as client:
-            result = client.put(temp_path, remote_key, show_progress=False, inline=True)
-            if not result["success"]:
-                raise RuntimeError(result["error"])
-            if on_progress:
-                try:
-                    on_progress(size, size)
-                except Exception:
-                    pass
-            return client.build_url(remote_key)
-
-    return await asyncio.to_thread(_do_upload)
-
-async def process_job(job):
-    if job.kind == "url":
-        await _process_url(job)
-    else:
-        await _process_file(job)
+# ═══════════════════════════════════════════════════════════
+# DESCARGA
+# ═══════════════════════════════════════════════════════════
 
 async def _download_sequential(session, url, temp_path, total, job):
     downloaded = 0
     last_pct = -1
-    timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
+    tracker = ProgressTracker()
+
     async with aiofiles.open(temp_path, "wb") as f:
-        async with session.get(url, headers=BROWSER_HEADERS, timeout=timeout) as resp:
+        async with session.get(url, headers=BROWSER_HEADERS) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"HTTP {resp.status}")
             async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
@@ -302,9 +381,12 @@ async def _download_sequential(session, url, temp_path, total, job):
                     pct = int(downloaded / total * 100)
                     if pct - last_pct >= 5 or pct == 100:
                         last_pct = pct
-                        await edit_status(app, job.chat_id, job.msg_id,
-                            f"┎ DOWNLOADING\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(downloaded)}/{format_size(total)}")
+                        await edit_status(
+                            app, job.chat_id, job.msg_id,
+                            build_progress("📥", "DOWNLOADING", downloaded, total, tracker)
+                        )
     return downloaded
+
 
 async def _download_parallel(session, url, temp_path, total, job):
     n_parts = PARALLEL_URL_PARTS
@@ -314,9 +396,11 @@ async def _download_parallel(session, url, temp_path, total, job):
         start = i * part_size
         end = start + part_size - 1 if i < n_parts - 1 else total - 1
         parts.append((i, start, end))
+
     progress = {"total": 0}
     progress_lock = asyncio.Lock()
     last_pct = [-1]
+    tracker = ProgressTracker()
 
     async def download_part(idx, start, end):
         path = f"{temp_path}.part{idx}"
@@ -333,11 +417,14 @@ async def _download_parallel(session, url, temp_path, total, job):
                         pct = int(progress["total"] / total * 100)
                         if pct - last_pct[0] >= 5 or pct == 100:
                             last_pct[0] = pct
-                            await edit_status(app, job.chat_id, job.msg_id,
-                                f"┎ DOWNLOADING (parallel x{n_parts})\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(progress['total'])}/{format_size(total)}")
+                            await edit_status(
+                                app, job.chat_id, job.msg_id,
+                                build_progress("📥", f"DOWNLOADING (x{n_parts})", progress["total"], total, tracker)
+                            )
         return path
 
     part_paths = await asyncio.gather(*[download_part(i, s, e) for i, s, e in parts])
+
     async with aiofiles.open(temp_path, "wb") as out:
         for p in part_paths:
             async with aiofiles.open(p, "rb") as src:
@@ -352,40 +439,24 @@ async def _download_parallel(session, url, temp_path, total, job):
                 pass
     return total
 
-async def _upload_and_notify(job, temp_path, filename, size):
-    try:
-        await edit_status(app, job.chat_id, job.msg_id, "UPLOADING...", force=True)
-        async def on_up(sent, total):
-            pct = int(sent / total * 100) if total else 0
-            await edit_status(app, job.chat_id, job.msg_id,
-                f"┎ UPLOADING → toDus S3\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(sent)}/{format_size(total)}")
-        url = await subir_a_s3(temp_path, filename, size, on_up)
-        name = os.path.splitext(filename)[0].replace("_", " ")
-        ext = os.path.splitext(filename)[1].replace(".", "")
-        await app.edit_message_text(
-            job.chat_id, job.msg_id,
-            f"┎ NAME: {name}\n┠ EXTENSION: {ext}\n┠ SIZE: {format_size(size)}\n┖ URL: {url}",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("📥 DESCARGAR", url=url)
-            ]]),
-        )
-    except Exception as e:
-        log.exception("error subiendo")
-        try:
-            await app.edit_message_text(job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}")
-        except Exception:
-            pass
-    finally:
-        try:
-            os.unlink(temp_path)
-        except Exception:
-            pass
+
+# ═══════════════════════════════════════════════════════════
+# PROCESAMIENTO
+# ═══════════════════════════════════════════════════════════
+
+async def process_job(job):
+    if job.kind == "url":
+        await _process_url(job)
+    else:
+        await _process_file(job)
+
 
 async def _process_url(job):
     url = job.url
     filename = sanitize_filename(get_filename_from_url(url) or f"file_{int(time.time())}")
     ext = os.path.splitext(filename)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+
     try:
         check_disk_space()
         async with aiohttp.ClientSession() as session:
@@ -401,7 +472,7 @@ async def _process_url(job):
                     pass
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
-                # Reintentos automáticos
+
                 max_retries = 3
                 for attempt in range(max_retries):
                     try:
@@ -413,15 +484,40 @@ async def _process_url(job):
                     except (aiohttp.ClientError, asyncio.TimeoutError) as e:
                         if attempt < max_retries - 1:
                             log.warning(f"Descarga falló (intento {attempt+1}): {e}. Reintentando...")
-                            try:
-                                os.unlink(temp_path)
-                            except Exception:
-                                pass
+                            try: os.unlink(temp_path)
+                            except Exception: pass
                             await asyncio.sleep(2 ** attempt)
                         else:
                             raise
+
         size = os.path.getsize(temp_path)
-        await _upload_and_notify(job, temp_path, filename, size)
+
+        await edit_status(app, job.chat_id, job.msg_id, "⬆️ UPLOADING...", force=True)
+        tracker = ProgressTracker()
+
+        async def on_up(sent, total):
+            await edit_status(
+                app, job.chat_id, job.msg_id,
+                build_progress("⬆️", "UPLOADING", sent, total, tracker)
+            )
+
+        upload_url = await subir_a_s3(temp_path, filename, size, on_up)
+
+        name = os.path.splitext(filename)[0].replace("_", " ")
+        ext_clean = ext.replace(".", "")
+        await app.edit_message_text(
+            job.chat_id, job.msg_id,
+            f"┎ ✅ COMPLETADO\n"
+            f"┠ NAME: {name}\n"
+            f"┠ EXTENSION: {ext_clean}\n"
+            f"┠ SIZE: {format_size(size)}\n"
+            f"┠ ⏱ Tiempo: {eta_str(tracker.get_elapsed())}\n"
+            f"┖ URL: {upload_url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
+            ]]),
+        )
+
     except asyncio.CancelledError:
         try:
             await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
@@ -434,28 +530,59 @@ async def _process_url(job):
             await app.edit_message_text(job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}")
         except Exception:
             pass
+    finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
 
+
 async def _process_file(job):
     original_name = sanitize_filename(job.original_name or f"file_{int(time.time())}")
     ext = os.path.splitext(original_name)[1] or ".bin"
     temp_path = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}{ext}")
+
     try:
         check_disk_space()
+        tracker = ProgressTracker()
 
         async def on_dl(current, total):
             if total:
-                pct = int(current / total * 100)
-                await edit_status(app, job.chat_id, job.msg_id,
-                    f"┎ DOWNLOADING FROM TELEGRAM\n┠ [{progress_bar(pct)}]\n┠ PERCENTAGE: {pct}%\n┖ SIZE: {format_size(current)}/{format_size(total)}")
+                await edit_status(
+                    app, job.chat_id, job.msg_id,
+                    build_progress("📥", "DOWNLOADING FROM TELEGRAM", current, total, tracker)
+                )
 
         original_msg = await app.get_messages(job.chat_id, job.original_msg_id)
         await original_msg.download(file_name=temp_path, progress=on_dl)
         size = os.path.getsize(temp_path)
-        await _upload_and_notify(job, temp_path, original_name, size)
+
+        await edit_status(app, job.chat_id, job.msg_id, "⬆️ UPLOADING...", force=True)
+        tracker_up = ProgressTracker()
+
+        async def on_up(sent, total):
+            await edit_status(
+                app, job.chat_id, job.msg_id,
+                build_progress("⬆️", "UPLOADING", sent, total, tracker_up)
+            )
+
+        upload_url = await subir_a_s3(temp_path, original_name, size, on_up)
+
+        name = os.path.splitext(original_name)[0].replace("_", " ")
+        ext_clean = ext.replace(".", "")
+        await app.edit_message_text(
+            job.chat_id, job.msg_id,
+            f"┎ ✅ COMPLETADO\n"
+            f"┠ NAME: {name}\n"
+            f"┠ EXTENSION: {ext_clean}\n"
+            f"┠ SIZE: {format_size(size)}\n"
+            f"┠ ⏱ Tiempo: {eta_str(tracker_up.get_elapsed())}\n"
+            f"┖ URL: {upload_url}",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("📥 DESCARGAR", url=upload_url)
+            ]]),
+        )
+
     except asyncio.CancelledError:
         try:
             await app.edit_message_text(job.chat_id, job.msg_id, "❌ CANCELADO")
@@ -468,10 +595,16 @@ async def _process_file(job):
             await app.edit_message_text(job.chat_id, job.msg_id, f"ERROR: {str(e)[:200]}")
         except Exception:
             pass
+    finally:
         try:
             os.unlink(temp_path)
         except Exception:
             pass
+
+
+# ═══════════════════════════════════════════════════════════
+# HANDLERS
+# ═══════════════════════════════════════════════════════════
 
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
@@ -479,7 +612,12 @@ async def cmd_start(client, message):
         "**Bot de subida a toDus S3**\n\n"
         "Envíame un enlace o un archivo (máx 2 GB).\n"
         "Se sube a `s3.todus.cu/stream` y te devuelvo el enlace.\n\n"
-        "**Comandos:**\n• /start — este mensaje\n• /cancel — cancelar tu trabajo\n• /status — ver tu posición en la cola")
+        "**Comandos:**\n"
+        "• /start — este mensaje\n"
+        "• /cancel — cancelar tu trabajo\n"
+        "• /status — ver tu posición en la cola"
+    )
+
 
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(client, message):
@@ -491,6 +629,7 @@ async def cmd_cancel(client, message):
         await message.reply_text("❌ Cancelando tu trabajo activo...")
     else:
         await message.reply_text("✅ Tu trabajo fue removido de la cola.")
+
 
 @app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
 async def on_cancel_callback(client, callback_query):
@@ -506,6 +645,7 @@ async def on_cancel_callback(client, callback_query):
     else:
         await callback_query.answer("✅ Removido de la cola.")
 
+
 @app.on_message(filters.command("status"))
 async def cmd_status(client, message):
     uid = message.from_user.id
@@ -519,7 +659,9 @@ async def cmd_status(client, message):
     else:
         await message.reply_text(
             f"⏳ Posición #{pos} de la cola.\n\n📊 Cola: {tq} esperando, {ta} procesando",
-            reply_markup=cancel_button(uid))
+            reply_markup=cancel_button(uid)
+        )
+
 
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status"]))
 async def handle_text(client, message):
@@ -542,12 +684,18 @@ async def handle_text(client, message):
     if position == 1:
         await status.edit_text("▶️ Eres el siguiente, procesando...", reply_markup=cancel_button(uid))
     else:
-        await status.edit_text(f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)", reply_markup=cancel_button(uid))
+        await status.edit_text(
+            f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)",
+            reply_markup=cancel_button(uid)
+        )
+
 
 @app.on_message(filters.document | filters.video | filters.audio | filters.voice | filters.video_note | filters.animation | filters.sticker | filters.photo)
 async def handle_media(client, message):
     uid = message.from_user.id
-    media = (message.document or message.video or message.audio or message.voice or message.video_note or message.animation or message.sticker or (message.photo[-1] if message.photo else None))
+    media = (message.document or message.video or message.audio or message.voice or
+             message.video_note or message.animation or message.sticker or
+             (message.photo[-1] if message.photo else None))
     if media is None:
         return
     file_size = getattr(media, "file_size", 0) or 0
@@ -569,7 +717,8 @@ async def handle_media(client, message):
         elif message.sticker: original_name = f"sticker_{ts}.webp"
         else: original_name = f"file_{ts}.bin"
     status = await message.reply_text("📥 Añadiendo a la cola...")
-    job = QueuedJob(user_id=uid, chat_id=message.chat.id, msg_id=status.id, kind="file", original_name=original_name, original_msg_id=message.id)
+    job = QueuedJob(user_id=uid, chat_id=message.chat.id, msg_id=status.id, kind="file",
+                    original_name=original_name, original_msg_id=message.id)
     try:
         position = await job_queue.enqueue(job)
     except ValueError:
@@ -578,21 +727,38 @@ async def handle_media(client, message):
     if position == 1:
         await status.edit_text("▶️ Eres el siguiente, procesando...", reply_markup=cancel_button(uid))
     else:
-        await status.edit_text(f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)", reply_markup=cancel_button(uid))
+        await status.edit_text(
+            f"⏳ En cola — posición #{position}\nEsperando turno... ({position - 1} delante de ti)",
+            reply_markup=cancel_button(uid)
+        )
+
+
+# ═══════════════════════════════════════════════════════════
+# HEALTH SERVER
+# ═══════════════════════════════════════════════════════════
 
 START_TIME = time.time()
 
+
 async def health_handler(request):
-    return web.json_response({"status": "healthy", "uptime": round(time.time() - START_TIME, 1), "queue_queued": job_queue.queued_count, "queue_active": job_queue.active_count})
+    return web.json_response({
+        "status": "healthy",
+        "uptime": round(time.time() - START_TIME, 1),
+        "queue_queued": job_queue.queued_count,
+        "queue_active": job_queue.active_count,
+    })
+
 
 async def root_handler(request):
     return web.json_response({"status": "online"})
+
 
 def make_web_app():
     a = web.Application()
     a.router.add_get("/", root_handler)
     a.router.add_get("/health", health_handler)
     return a
+
 
 async def run_web():
     a = make_web_app()
@@ -601,6 +767,11 @@ async def run_web():
     site = web.TCPSite(runner, "0.0.0.0", PORT)
     await site.start()
     return runner
+
+
+# ═══════════════════════════════════════════════════════════
+# WATCHDOG
+# ═══════════════════════════════════════════════════════════
 
 async def watchdog():
     while True:
@@ -612,6 +783,11 @@ async def watchdog():
             await asyncio.sleep(10)
             log.error("watchdog: forzando os._exit")
             os._exit(0)
+
+
+# ═══════════════════════════════════════════════════════════
+# ARRANQUE
+# ═══════════════════════════════════════════════════════════
 
 async def main():
     web_runner = await run_web()
@@ -627,6 +803,7 @@ async def main():
         await app.stop()
         await web_runner.cleanup()
         log.info("apagado completo")
+
 
 if __name__ == "__main__":
     app.run(main())
