@@ -20,19 +20,16 @@ QUEUE_WORKERS = 1
 CHUNK_SIZE = 16 * 1024 * 1024
 POSITION_POLL_INTERVAL = 3
 WATCHDOG_LIFETIME = 14100
-PARALLEL_URL_DOWNLOAD = True
+PARALLEL_URL_DOWNLOAD = False
 PARALLEL_URL_PARTS = 4
 PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
 
 BROWSER_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+    "Accept": "*/*",
     "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
     "Accept-Encoding": "gzip, deflate, br",
-    "Sec-Fetch-Dest": "document",
-    "Sec-Fetch-Mode": "navigate",
-    "Sec-Fetch-Site": "none",
-    "Upgrade-Insecure-Requests": "1",
+    "Connection": "keep-alive",
 }
 
 os.makedirs(DOWNLOAD_PATH, exist_ok=True)
@@ -291,8 +288,9 @@ async def process_job(job):
 async def _download_sequential(session, url, temp_path, total, job):
     downloaded = 0
     last_pct = -1
+    timeout = aiohttp.ClientTimeout(total=None, connect=60, sock_read=300)
     async with aiofiles.open(temp_path, "wb") as f:
-        async with session.get(url, headers=BROWSER_HEADERS) as resp:
+        async with session.get(url, headers=BROWSER_HEADERS, timeout=timeout) as resp:
             if resp.status >= 400:
                 raise RuntimeError(f"HTTP {resp.status}")
             async for chunk in resp.content.iter_chunked(CHUNK_SIZE):
@@ -391,11 +389,11 @@ async def _process_url(job):
     try:
         check_disk_space()
         async with aiohttp.ClientSession() as session:
-            async with asyncio.timeout(1200):
+            async with asyncio.timeout(3600):
                 total = 0
                 accepts_ranges = False
                 try:
-                    async with session.head(url, headers=BROWSER_HEADERS) as h:
+                    async with session.head(url, headers=BROWSER_HEADERS, timeout=aiohttp.ClientTimeout(total=30)) as h:
                         if h.status < 400:
                             total = int(h.headers.get("Content-Length", 0))
                             accepts_ranges = h.headers.get("Accept-Ranges", "").lower() == "bytes"
@@ -403,10 +401,25 @@ async def _process_url(job):
                     pass
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(f"Archivo {format_size(total)} supera el límite")
-                if PARALLEL_URL_DOWNLOAD and accepts_ranges and total >= PARALLEL_URL_MIN_SIZE:
-                    await _download_parallel(session, url, temp_path, total, job)
-                else:
-                    await _download_sequential(session, url, temp_path, total, job)
+                # Reintentos automáticos
+                max_retries = 3
+                for attempt in range(max_retries):
+                    try:
+                        if PARALLEL_URL_DOWNLOAD and accepts_ranges and total >= PARALLEL_URL_MIN_SIZE:
+                            await _download_parallel(session, url, temp_path, total, job)
+                        else:
+                            await _download_sequential(session, url, temp_path, total, job)
+                        break
+                    except (aiohttp.ClientError, asyncio.TimeoutError) as e:
+                        if attempt < max_retries - 1:
+                            log.warning(f"Descarga falló (intento {attempt+1}): {e}. Reintentando...")
+                            try:
+                                os.unlink(temp_path)
+                            except Exception:
+                                pass
+                            await asyncio.sleep(2 ** attempt)
+                        else:
+                            raise
         size = os.path.getsize(temp_path)
         await _upload_and_notify(job, temp_path, filename, size)
     except asyncio.CancelledError:
