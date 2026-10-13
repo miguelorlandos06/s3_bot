@@ -4,9 +4,13 @@ on:
   workflow_dispatch:
     inputs:
       debug_enabled:
-        description: 'Habilitar depuracion con upterm'
+        description: 'Habilitar sesion upterm (no bloquea el arranque del bot)'
         required: false
         default: 'false'
+  push:
+    branches: [main]
+  schedule:
+    - cron: '0 */4 * * *'
 
 concurrency:
   group: todus-bot
@@ -29,25 +33,12 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Setup upterm session
+      - name: Setup upterm session (opcional)
         uses: owenthereal/action-upterm@v1
         if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled == 'true' }}
         with:
           limit-access-to-actor: true
           detached: true
-
-      - name: Keep session alive
-        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled == 'true' }}
-        run: |
-          echo "Sesion upterm iniciada. Reconecta y ejecuta 'touch continue' para finalizar."
-          for i in $(seq 1 30); do
-            if [ -f continue ]; then
-              echo "Detectado 'continue', saliendo..."
-              exit 0
-            fi
-            sleep 60
-          done
-          echo "Timeout, finalizando."
 
       - name: Run bot
         env:
