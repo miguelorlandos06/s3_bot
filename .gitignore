@@ -1,0 +1,48 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+dist/
+*.egg-info/
+.eggs/
+
+# Entornos virtuales
+.venv/
+venv/
+env/
+ENV/
+
+# Secretos
+.env
+.env.*
+*.env
+secrets.txt
+config.local.*
+run_bot.sh
+
+# Backups y temporales
+.backup_*/
+*_backup_*/
+*.bak
+*.tmp
+*.log
+
+# Sesiones de Pyrogram
+*.session
+*.session-journal
+todus_bot.session*
+
+# Descargas del bot
+todus_uploads/
+todus_uploads_*/
+
+# Editores / OS
+.vscode/
+.idea/
+*.swp
+*.swo
+.DS_Store
+Thumbs.db

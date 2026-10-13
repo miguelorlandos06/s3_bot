@@ -1,0 +1,58 @@
+name: Bot
+
+on:
+  workflow_dispatch:
+    inputs:
+      debug_enabled:
+        description: 'Habilitar depuracion con upterm'
+        required: false
+        default: 'false'
+
+concurrency:
+  group: todus-bot
+  cancel-in-progress: true
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version-file: '.python-version'
+
+      - name: Install dependencies
+        run: |
+          pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Setup upterm session
+        uses: owenthereal/action-upterm@v1
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled == 'true' }}
+        with:
+          limit-access-to-actor: true
+          detached: true
+
+      - name: Keep session alive
+        if: ${{ github.event_name == 'workflow_dispatch' && inputs.debug_enabled == 'true' }}
+        run: |
+          echo "Sesion upterm iniciada. Reconecta y ejecuta 'touch continue' para finalizar."
+          for i in $(seq 1 30); do
+            if [ -f continue ]; then
+              echo "Detectado 'continue', saliendo..."
+              exit 0
+            fi
+            sleep 60
+          done
+          echo "Timeout, finalizando."
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          API_ID: ${{ secrets.API_ID }}
+          API_HASH: ${{ secrets.API_HASH }}
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
+        run: python bot.py
