@@ -23,6 +23,20 @@ jobs:
         with:
           python-version-file: '.python-version'
 
+      - name: Check secret presence
+        env:
+          AID: ${{ secrets.API_ID }}
+          AHASH: ${{ secrets.API_HASH }}
+          BTOK: ${{ secrets.BOT_TOKEN }}
+        run: |
+          echo "API_ID length:    ${#AID}"
+          echo "API_HASH length:  ${#AHASH}"
+          echo "BOT_TOKEN length: ${#BTOK}"
+          if [ -z "$AID" ] || [ -z "$AHASH" ] || [ -z "$BTOK" ]; then
+            echo "::error::Falta algun secret. Revisa Settings -> Secrets -> Actions"
+            exit 1
+          fi
+
       - name: Install dependencies
         run: |
           pip install --upgrade pip
@@ -31,27 +45,36 @@ jobs:
       - name: Start telegram-bot-api local server
         run: |
           mkdir -p /tmp/tg-data
+          docker rm -f tg-bot-api 2>/dev/null || true
           docker run -d --name tg-bot-api \
             -p 127.0.0.1:8081:8081 \
             -v /tmp/tg-data:/var/lib/telegram-bot-api \
+            -e TELEGRAM_API_ID=${{ secrets.API_ID }} \
+            -e TELEGRAM_API_HASH=${{ secrets.API_HASH }} \
+            -e TELEGRAM_LOCAL=1 \
             aiogram/telegram-bot-api:latest \
-            --api-id=${{ secrets.API_ID }} \
-            --api-hash=${{ secrets.API_HASH }} \
             --local \
             --http-port=8081 \
             --dir=/var/lib/telegram-bot-api
 
           echo "Esperando a telegram-bot-api..."
+          ready=0
           for i in $(seq 1 30); do
             if curl -sf "http://localhost:8081" >/dev/null 2>&1; then
               echo "listo en $((i*2))s"
+              ready=1
               break
             fi
             sleep 2
           done
 
           echo "--- logs del server local ---"
-          docker logs tg-bot-api 2>&1 | tail -20 || true
+          docker logs tg-bot-api 2>&1 | tail -30 || true
+
+          if [ "$ready" != "1" ]; then
+            echo "::error::telegram-bot-api no respondio en 60s"
+            exit 1
+          fi
 
       - name: Run bot
         env:
@@ -70,3 +93,5 @@ jobs:
         run: |
           echo "--- logs del server local ---"
           docker logs tg-bot-api 2>&1 | tail -100 || true
+          echo "--- ps aux ---"
+          ps aux | grep -E 'python|bot.py' | grep -v grep || true
