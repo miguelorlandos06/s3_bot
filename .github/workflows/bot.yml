@@ -44,21 +44,26 @@ jobs:
 
       - name: Start telegram-bot-api local server
         run: |
-          mkdir -p /tmp/tg-data
+          # Directorio dedicado, mismo path dentro y fuera del contenedor
+          TG_DIR=/tmp/tg-files
+          sudo mkdir -p "$TG_DIR/tmp"
+          sudo chmod -R 777 "$TG_DIR"
+
           docker rm -f tg-bot-api 2>/dev/null || true
 
           docker run -d --name tg-bot-api \
             -p 127.0.0.1:8081:8081 \
-            -v /tmp/tg-data:/var/lib/telegram-bot-api \
+            -v "$TG_DIR:$TG_DIR" \
             -e TELEGRAM_API_ID=${{ secrets.API_ID }} \
             -e TELEGRAM_API_HASH=${{ secrets.API_HASH }} \
             -e TELEGRAM_LOCAL=1 \
             aiogram/telegram-bot-api:latest \
             --local \
             --http-port=8081 \
-            --dir=/var/lib/telegram-bot-api
+            --dir="$TG_DIR" \
+            --temp-dir="$TG_DIR/tmp"
 
-          echo "Esperando a telegram-bot-api (acepto cualquier HTTP, incluido 404)..."
+          echo "Esperando a telegram-bot-api..."
           ready=0
           for i in $(seq 1 45); do
             code=$(curl -s -o /dev/null -w "%{http_code}" "http://localhost:8081/" || echo "000")
@@ -70,20 +75,15 @@ jobs:
             sleep 2
           done
 
-          echo "--- estado del contenedor ---"
           docker ps -a --filter name=tg-bot-api || true
-
-          echo "--- logs del server local (ultimas 60 lineas) ---"
-          docker logs tg-bot-api 2>&1 | tail -60 || true
+          docker logs tg-bot-api 2>&1 | tail -30 || true
 
           if [ "$ready" != "1" ]; then
-            echo "::error::telegram-bot-api no abrio el puerto en 90s"
-            echo "--- logs completos ---"
+            echo "::error::telegram-bot-api no abrio el puerto"
             docker logs tg-bot-api 2>&1 || true
             exit 1
           fi
 
-          # Espera extra para que termine de sincronizar con los DC de Telegram
           echo "Esperando sincronizacion con Telegram (10s)..."
           sleep 10
 
@@ -94,15 +94,15 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           TELEGRAM_API_URL: http://localhost:8081/bot
           TELEGRAM_LOCAL_MODE: "true"
-          TG_BOT_API_DIR: /tmp/tg-data
+          TG_BOT_API_DIR: /tmp/tg-files
           TODUS_TMP: /tmp/todus
           PORT: "10000"
         run: python bot.py
 
-      - name: Dump tg-bot-api logs on failure
+      - name: Dump logs and tree on failure
         if: failure()
         run: |
           echo "--- logs del server local ---"
           docker logs tg-bot-api 2>&1 | tail -200 || true
-          echo "--- procesos python ---"
-          ps aux | grep -E 'python|bot.py' | grep -v grep || true
+          echo "--- arbol /tmp/tg-files ---"
+          find /tmp/tg-files -maxdepth 4 2>/dev/null | head -80 || true

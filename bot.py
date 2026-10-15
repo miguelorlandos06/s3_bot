@@ -942,12 +942,29 @@ async def handle_media(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
 
     # Obtener ruta local
     local_file_path = getattr(media, "file_path", None)
-    if not local_file_path and TELEGRAM_LOCAL_MODE:
+
+    if TELEGRAM_LOCAL_MODE:
         try:
             tg_file = await ctx.bot.get_file(media.file_id)
             local_file_path = tg_file.file_path
+            log.info(f"file_path resuelto: {local_file_path}")
         except Exception as e:
             log.warning(f"get_file fallo: {e}")
+
+    if local_file_path and not os.path.isabs(local_file_path):
+        local_file_path = os.path.join(TG_BOT_API_DIR, local_file_path)
+
+    if local_file_path and not os.path.isfile(local_file_path):
+        log.warning(f"local_file_path no existe: {local_file_path}")
+        try:
+            target = os.path.basename(local_file_path)
+            for root, dirs, files in os.walk(TG_BOT_API_DIR):
+                if target in files:
+                    local_file_path = os.path.join(root, target)
+                    log.info(f"encontrado en fallback: {local_file_path}")
+                    break
+        except Exception:
+            pass
 
     fields = [("NAME", f"<code>{h(original_name)}</code>")]
     if file_size: fields.append(("SIZE", f"<code>{format_size(file_size)}</code>"))
