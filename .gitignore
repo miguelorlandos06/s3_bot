@@ -46,3 +46,4 @@ todus_uploads_*/
 *.swo
 .DS_Store
 Thumbs.db
+tg-data/

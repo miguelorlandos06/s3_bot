@@ -1,5 +1,4 @@
-pyrogram>=2.0.106
-tgcrypto>=1.2.5
+python-telegram-bot[rate-limiter]>=21.6
 aiohttp>=3.10.0
 aiofiles>=23.2.1
 requests>=2.25
