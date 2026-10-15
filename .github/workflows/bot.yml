@@ -37,7 +37,6 @@ jobs:
 
           docker rm -f tg-bot-api 2>/dev/null || true
 
-          # SIN -u: dejamos que el entrypoint haga su chown como root
           docker run -d --name tg-bot-api \
             -p 127.0.0.1:8081:8081 \
             -v "$TG_DIR:$TG_DIR" \
@@ -50,11 +49,10 @@ jobs:
             --dir="$TG_DIR" \
             --temp-dir="$TG_DIR/tmp"
 
-          echo "=== esperando al server local ==="
           ready=0
           for i in $(seq 1 45); do
             code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8081/" 2>/dev/null || echo "000")
-            if [ "$code" != "000" ] && [ -n "$code" ] && [ "$code" != "" ]; then
+            if [ "$code" != "000" ] && [ -n "$code" ]; then
               echo "listo en $((i*2))s (HTTP $code)"
               ready=1
               break
@@ -69,22 +67,15 @@ jobs:
             exit 1
           fi
 
-          echo "=== estado ==="
-          docker ps --filter name=tg-bot-api
-
           echo "=== getMe con token real ==="
           curl -sS -o /dev/null -w "getMe HTTP: %{http_code}\n" \
             "http://127.0.0.1:8081/bot${{ secrets.BOT_TOKEN }}/getMe" || true
 
-          echo "=== keeper de permisos en background ==="
-          # Los subdirectorios nuevos los crea el server con UID 101,
-          # asi que forzamos 777 cada 5s para que el bot pueda leerlos
           ( while true; do
               sudo chmod -R 777 /var/lib/telegram-bot-api 2>/dev/null || true
               sleep 5
             done ) &
           echo "keeper PID: $!"
-
           sleep 3
 
       - name: Run bot
@@ -92,7 +83,7 @@ jobs:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          TELEGRAM_API_URL: http://127.0.0.1:8081
+          TELEGRAM_API_URL: http://127.0.0.1:8081/bot
           TELEGRAM_LOCAL_MODE: "true"
           TG_BOT_API_DIR: /var/lib/telegram-bot-api
           TODUS_TMP: /tmp/todus
@@ -102,7 +93,5 @@ jobs:
       - name: Dump logs on failure
         if: failure() || cancelled()
         run: |
-          echo "--- logs tg-bot-api ---"
           docker logs tg-bot-api 2>&1 | tail -200 || true
-          echo "--- arbol ---"
           sudo find /var/lib/telegram-bot-api -maxdepth 5 2>/dev/null | head -100 || true

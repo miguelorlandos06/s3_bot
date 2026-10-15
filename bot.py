@@ -28,7 +28,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
 TELEGRAM_API_URL = os.environ.get(
-    "TELEGRAM_API_URL", "http://127.0.0.1:8081")
+    "TELEGRAM_API_URL", "http://127.0.0.1:8081/bot")
 TELEGRAM_LOCAL_MODE = os.environ.get(
     "TELEGRAM_LOCAL_MODE", "true").lower() == "true"
 
@@ -1061,9 +1061,14 @@ async def main_async():
     )
 
     if TELEGRAM_LOCAL_MODE:
+        # base_url DEBE terminar en /bot porque PTB concatena <TOKEN> directo
+        _base = TELEGRAM_API_URL.rstrip("/")
+        if not _base.endswith("/bot"):
+            _base = _base + "/bot"
+        log.info(f"base_url final: {_base}")
         builder = (
             ApplicationBuilder()
-            .base_url(TELEGRAM_API_URL)
+            .base_url(_base)
             .local_mode(True)
             .token(BOT_TOKEN)
             .request(request)
