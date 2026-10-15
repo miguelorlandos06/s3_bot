@@ -1060,10 +1060,18 @@ async def main_async():
         connect_timeout=30,
     )
 
-    builder = ApplicationBuilder().token(BOT_TOKEN).request(request)
+    if TELEGRAM_LOCAL_MODE:
+        builder = (
+            ApplicationBuilder()
+            .base_url(TELEGRAM_API_URL)
+            .local_mode(True)
+            .token(BOT_TOKEN)
+            .request(request)
+        )
+    else:
+        builder = ApplicationBuilder().token(BOT_TOKEN).request(request)
 
     if TELEGRAM_LOCAL_MODE:
-        builder = builder.base_url(TELEGRAM_API_URL).local_mode(True)
         log.info(f"LOCAL MODE activo -> {TELEGRAM_API_URL}")
 
     application = builder.post_init(post_init).build()
