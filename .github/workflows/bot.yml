@@ -28,70 +28,10 @@ jobs:
           pip install --upgrade pip
           pip install -r requirements.txt
 
-      - name: Start telegram-bot-api local server
-        run: |
-          TG_DIR=/var/lib/telegram-bot-api
-          sudo rm -rf "$TG_DIR"
-          sudo mkdir -p "$TG_DIR"
-          sudo chmod -R 777 "$TG_DIR"
-
-          docker rm -f tg-bot-api 2>/dev/null || true
-
-          docker run -d --name tg-bot-api \
-            -p 127.0.0.1:8081:8081 \
-            -v "$TG_DIR:$TG_DIR" \
-            -e TELEGRAM_API_ID=${{ secrets.API_ID }} \
-            -e TELEGRAM_API_HASH=${{ secrets.API_HASH }} \
-            -e TELEGRAM_LOCAL=1 \
-            aiogram/telegram-bot-api:latest \
-            --local \
-            --http-port=8081 \
-            --dir="$TG_DIR" \
-            --temp-dir="$TG_DIR/tmp"
-
-          ready=0
-          for i in $(seq 1 45); do
-            code=$(curl -s -o /dev/null -w "%{http_code}" "http://127.0.0.1:8081/" 2>/dev/null || echo "000")
-            if [ "$code" != "000" ] && [ -n "$code" ]; then
-              echo "listo en $((i*2))s (HTTP $code)"
-              ready=1
-              break
-            fi
-            sleep 2
-          done
-
-          if [ "$ready" != "1" ]; then
-            echo "::error::server local no respondio"
-            docker ps -a --filter name=tg-bot-api
-            docker logs tg-bot-api 2>&1 | tail -100
-            exit 1
-          fi
-
-          echo "=== getMe con token real ==="
-          curl -sS -o /dev/null -w "getMe HTTP: %{http_code}\n" \
-            "http://127.0.0.1:8081/bot${{ secrets.BOT_TOKEN }}/getMe" || true
-
-          ( while true; do
-              sudo chmod -R 777 /var/lib/telegram-bot-api 2>/dev/null || true
-              sleep 5
-            done ) &
-          echo "keeper PID: $!"
-          sleep 3
-
       - name: Run bot
         env:
           BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
-          TELEGRAM_API_URL: http://127.0.0.1:8081/bot
-          TELEGRAM_LOCAL_MODE: "true"
-          TG_BOT_API_DIR: /var/lib/telegram-bot-api
-          TODUS_TMP: /tmp/todus
-          PORT: "10000"
+          SESSION_STRING: ${{ secrets.SESSION_STRING }}
         run: python bot.py
-
-      - name: Dump logs on failure
-        if: failure() || cancelled()
-        run: |
-          docker logs tg-bot-api 2>&1 | tail -200 || true
-          sudo find /var/lib/telegram-bot-api -maxdepth 5 2>/dev/null | head -100 || true
