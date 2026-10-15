@@ -87,11 +87,6 @@ def format_size(b):
     return f"{b / 1073741824:.2f} GB"
 
 
-def progress_bar(pct, width=16):
-    filled = round(width * pct / 100)
-    return "#" * filled + "-" * (width - filled)
-
-
 def speed_str(bps):
     if bps < 1024:
         return f"{bps:.0f} B/s"
@@ -106,6 +101,11 @@ def eta_str(seconds):
     if seconds < 3600:
         return f"{int(seconds // 60)}m {int(seconds % 60)}s"
     return f"{int(seconds // 3600)}h {int((seconds % 3600) // 60)}m"
+
+
+def progress_bar(pct, width=16):
+    filled = round(width * pct / 100)
+    return "\u2726" * filled + "\u2727" * (width - filled)
 
 
 def humanize_error(exc) -> str:
@@ -129,40 +129,57 @@ def humanize_error(exc) -> str:
     return f"Error inesperado: <code>{h(str(exc)[:150])}</code>"
 
 
-PHASE_ICONS = {
-    "Descargando": "[DL]",
-    "Descargando de Telegram": "[TG]",
-    "Subiendo": "[UP]",
+PHASE_TITLES = {
+    "Descargando": "DOWNLOADING",
+    "Descargando de Telegram": "DOWNLOADING FROM TELEGRAM",
+    "Subiendo": "UPLOADING",
 }
 
 
+def _render_box(title, fields):
+    """
+    title: string del titulo (primera linea, con esquina superior)
+    fields: lista de (clave, valor)
+    """
+    keys = [k for k, _ in fields]
+    max_key_len = max(len(k) for k in keys)
+
+    lines = [f"\u2553 {title}"]
+
+    total = len(fields)
+    for i, (key, val) in enumerate(fields):
+        if i == total - 1:
+            prefix = "\u2559"
+        else:
+            prefix = "\u2551"
+        pad = " " * (max_key_len - len(key))
+        lines.append(f"{prefix} {key}:{pad} {val}")
+
+    return "\n".join(lines)
+
+
 def render_progress(phase, current, total, tracker, filename="", extra=""):
-    icon = PHASE_ICONS.get(phase, "[..]")
+    title = PHASE_TITLES.get(phase, phase.upper())
     pct = int(current / total * 100) if total else 0
     tracker.update(current, total)
 
     bar = progress_bar(pct, width=16)
+    progress_val = f"<code>{bar}</code> <b>{pct}%</b>"
 
-    lines = [f"{icon} <b>{h(phase)}</b>"]
+    fields = []
     if filename:
-        lines.append(f"- <code>{h(filename)}</code>")
-    lines.append("")
-    lines.append(f"<code>{bar}</code> <b>{pct}%</b>")
-    lines.append(f"- {format_size(current)} / {format_size(total)}")
-
-    stats = []
+        fields.append(("NAME", f"<code>{h(filename)}</code>"))
+    if extra:
+        fields.append(("MODE", f"<code>{extra}</code>"))
+    fields.append(("SIZE", f"<code>{format_size(current)} / {format_size(total)}</code>"))
+    fields.append(("PROGRESS", progress_val))
     if tracker.speed > 0:
-        stats.append(speed_str(tracker.speed))
+        fields.append(("SPEED", f"<code>{speed_str(tracker.speed)}</code>"))
     eta = tracker.get_eta(current, total)
     if eta > 0:
-        stats.append(f"ETA {eta_str(eta)}")
-    if stats:
-        lines.append("- " + " | ".join(stats))
+        fields.append(("ETA", f"<code>{eta_str(eta)}</code>"))
 
-    if extra:
-        lines.append(f"- {extra}")
-
-    return "\n".join(lines)
+    return _render_box(title, fields)
 
 
 class ProgressTracker:
@@ -275,7 +292,7 @@ async def notify_processing(job):
     try:
         await app.edit_message_text(
             job.chat_id, job.msg_id,
-            "<b>Es tu turno</b>\n\n- <i>Preparando...</i>",
+            _render_box("PROCESSING", [("STATUS", "preparando")]),
             reply_markup=cancel_button(job.user_id),
         )
     except Exception:
@@ -449,14 +466,18 @@ class JobQueue:
                         continue
                     job.last_position = pos
                     if pos == 1:
-                        text = (
-                            "<b>Eres el siguiente</b>\n\n"
-                            "- <i>Preparando...</i>"
+                        text = _render_box(
+                            "NEXT",
+                            [("STATUS", "preparando")],
                         )
                     else:
-                        text = (
-                            f"<b>En cola</b> - posicion <b>#{pos}</b>\n\n"
-                            f"- <i>{pos - 1} delante de ti</i>"
+                        text = _render_box(
+                            "QUEUE",
+                            [
+                                ("POSITION", f"#{pos}"),
+                                ("AHEAD",    f"{pos - 1} trabajos"),
+                                ("ESTIMATE", "~4m"),
+                            ],
                         )
                     try:
                         await app.edit_message_text(
@@ -588,30 +609,26 @@ async def process_job(job):
 
 
 def _success_message(filename, size, elapsed, upload_url):
-    return (
-        "<b>Completado</b>\n\n"
-        f"- Archivo: <code>{h(filename)}</code>\n"
-        f"- Tamano: {format_size(size)}\n"
-        f"- Tiempo: {eta_str(elapsed)}\n\n"
-        f"Enlace: {h(upload_url)}\n\n"
-        "<blockquote>Guarda el enlace: es la unica copia publica.</blockquote>"
-    )
+    return _render_box("DONE", [
+        ("NAME", f"<code>{h(filename)}</code>"),
+        ("SIZE", f"<code>{format_size(size)}</code>"),
+        ("TIME", f"<code>{eta_str(elapsed)}</code>"),
+        ("URL",  f'<a href="{upload_url}">{h(upload_url)}</a>'),
+    ])
 
 
 def _error_message(filename, exc):
-    return (
-        "<b>Error al procesar</b>\n\n"
-        f"- Archivo: <code>{h(filename)}</code>\n"
-        f"- {humanize_error(exc)}"
-    )
+    return _render_box("ERROR", [
+        ("NAME",  f"<code>{h(filename)}</code>"),
+        ("CAUSE", humanize_error(exc)),
+    ])
 
 
 def _cancel_message(filename):
-    return (
-        "<b>Cancelado</b>\n\n"
-        f"- Archivo: <code>{h(filename)}</code>\n"
-        "- Solicitado por ti"
-    )
+    return _render_box("CANCELLED", [
+        ("NAME",   f"<code>{h(filename)}</code>"),
+        ("REASON", "solicitado por ti"),
+    ])
 
 
 async def _process_url(job):
@@ -794,18 +811,17 @@ async def _process_file(job):
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
     await message.reply_text(
-        "<b>Todus Uploader</b>\n"
-        "<i>Sube archivos y URLs a s3.todus.cu/stream</i>\n\n"
-        "<b>Como usarlo</b>\n"
-        "- Enviame un <b>archivo</b> (hasta 5 GB)\n"
-        "- O pegame un <b>enlace directo</b>\n"
-        "- Te aviso con el progreso y te doy la URL publica\n\n"
-        "<b>Comandos</b>\n"
-        "- /start - este mensaje\n"
-        "- /status - ver tu posicion en la cola\n"
-        "- /cancel - cancelar tu trabajo actual\n\n"
-        "<blockquote>Solo enlaces directos. "
-        "No soporto YouTube, Mega ni similares.</blockquote>"
+        _render_box("TODUS UPLOADER", [
+            ("INFO",  "sube archivos y URLs a s3.todus.cu/stream"),
+            ("USO",   "enviame un archivo (hasta 5 GB) o un enlace directo"),
+            ("NOTA",  "solo enlaces directos. No soporto YouTube, Mega ni similares."),
+        ])
+        + "\n\n"
+        + _render_box("COMANDOS", [
+            ("/start",  "este mensaje"),
+            ("/status", "ver tu posicion en la cola"),
+            ("/cancel", "cancelar tu trabajo actual"),
+        ])
     )
 
 
@@ -815,13 +831,22 @@ async def cmd_cancel(client, message):
     result = await job_queue.cancel_user(uid)
     if result == "none":
         await message.reply_text(
-            "<b>Sin trabajos activos</b>\n\n"
-            "No tienes nada en curso ni en cola."
+            _render_box("CANCEL", [
+                ("INFO", "no tienes nada en curso ni en cola."),
+            ])
         )
     elif result == "active":
-        await message.reply_text("<b>Cancelando...</b>")
+        await message.reply_text(
+            _render_box("CANCELLING", [
+                ("STATUS", "esperando confirmacion del proceso activo"),
+            ])
+        )
     else:
-        await message.reply_text("<b>Removido de la cola</b>")
+        await message.reply_text(
+            _render_box("CANCELLED", [
+                ("STATUS", "tu trabajo fue retirado de la cola"),
+            ])
+        )
 
 
 @app.on_callback_query(filters.regex(r"^cancel:(\d+)$"))
@@ -846,25 +871,28 @@ async def cmd_status(client, message):
     pos = job_queue.position_of(uid)
     tq = job_queue.queued_count
     ta = job_queue.active_count
-    footer = (
-        f"\n\nCola global: <b>{tq}</b> esperando - "
-        f"<b>{ta}</b> procesando"
-    )
 
     if pos is None:
         await message.reply_text(
-            "<b>Sin trabajos activos</b>\n\n"
-            "Enviame un enlace o un archivo para empezar." + footer
+            _render_box("STATUS", [
+                ("INFO",  "enviame un enlace o un archivo para empezar."),
+                ("QUEUE", f"{tq} esperando, {ta} procesando"),
+            ])
         )
     elif pos == 0:
         await message.reply_text(
-            "<b>Tu trabajo esta activo</b>\n\n"
-            "- <i>Procesandose ahora mismo</i>" + footer
+            _render_box("STATUS", [
+                ("STATE", "procesandose ahora mismo"),
+                ("QUEUE", f"{tq} esperando, {ta} procesando"),
+            ])
         )
     else:
         await message.reply_text(
-            f"<b>Estas en la cola</b> - posicion <b>#{pos}</b>\n\n"
-            f"- <i>{pos - 1} delante de ti</i>" + footer,
+            _render_box("QUEUE", [
+                ("POSITION", f"#{pos}"),
+                ("AHEAD",    f"{pos - 1} trabajos"),
+                ("QUEUE",    f"{tq} esperando, {ta} procesando"),
+            ]),
             reply_markup=cancel_button(uid),
         )
 
@@ -875,24 +903,26 @@ async def handle_text(client, message):
     url = extract_url(message.text)
     if not url:
         await message.reply_text(
-            "<b>No encontre un enlace valido</b>\n\n"
-            f"Enviame un enlace directo o un archivo "
-            f"(maximo {format_size(MAX_FILE_SIZE)})."
+            _render_box("ERROR", [
+                ("INFO", f"enviame un enlace directo o un archivo (maximo {format_size(MAX_FILE_SIZE)})."),
+            ])
         )
         return
     if job_queue.has_user_job(uid):
         await message.reply_text(
-            "<b>Ya tienes un trabajo en curso</b>\n\n"
-            "Espera a que termine o usa /cancel."
+            _render_box("WAIT", [
+                ("INFO", "ya tienes un trabajo en curso. Espera o usa /cancel."),
+            ])
         )
         return
 
     parsed = urlparse(url)
     domain = parsed.netloc or "origen"
     status = await message.reply_text(
-        "<b>Recibido</b>\n"
-        f"- Origen: <code>{h(domain)}</code>\n\n"
-        "<i>Anadiendo a la cola...</i>"
+        _render_box("RECEIVED", [
+            ("ORIGIN", f"<code>{h(domain)}</code>"),
+            ("INFO",   "anadiendo a la cola..."),
+        ])
     )
     job = QueuedJob(
         user_id=uid, chat_id=message.chat.id,
@@ -901,18 +931,22 @@ async def handle_text(client, message):
     try:
         position = await job_queue.enqueue(job)
     except ValueError:
-        await status.edit_text("<b>Ya tienes un trabajo en curso</b>")
+        await status.edit_text(
+            _render_box("WAIT", [("INFO", "ya tienes un trabajo en curso.")])
+        )
         return
 
     if position == 1:
         await status.edit_text(
-            "<b>Eres el siguiente</b>\n\n- <i>Preparando...</i>",
+            _render_box("NEXT", [("STATUS", "preparando")]),
             reply_markup=cancel_button(uid),
         )
     else:
         await status.edit_text(
-            f"<b>En cola</b> - posicion <b>#{position}</b>\n\n"
-            f"- <i>{position - 1} delante de ti</i>",
+            _render_box("QUEUE", [
+                ("POSITION", f"#{position}"),
+                ("AHEAD",    f"{position - 1} trabajos"),
+            ]),
             reply_markup=cancel_button(uid),
         )
 
@@ -933,14 +967,16 @@ async def handle_media(client, message):
     file_size = getattr(media, "file_size", 0) or 0
     if file_size and file_size > MAX_FILE_SIZE:
         await message.reply_text(
-            "<b>Archivo demasiado grande</b>\n\n"
-            f"- {format_size(file_size)} > 5 GB"
+            _render_box("ERROR", [
+                ("INFO", f"archivo demasiado grande: {format_size(file_size)} > 5 GB"),
+            ])
         )
         return
     if job_queue.has_user_job(uid):
         await message.reply_text(
-            "<b>Ya tienes un trabajo en curso</b>\n\n"
-            "Espera o usa /cancel."
+            _render_box("WAIT", [
+                ("INFO", "ya tienes un trabajo en curso. Espera o usa /cancel."),
+            ])
         )
         return
 
@@ -964,12 +1000,12 @@ async def handle_media(client, message):
         else:
             original_name = f"file_{ts}.bin"
 
-    size_hint = f" - {format_size(file_size)}" if file_size else ""
-    status = await message.reply_text(
-        "<b>Archivo recibido</b>\n"
-        f"- <code>{h(original_name)}</code>{size_hint}\n\n"
-        "<i>Anadiendo a la cola...</i>"
-    )
+    fields = [("NAME", f"<code>{h(original_name)}</code>")]
+    if file_size:
+        fields.append(("SIZE", f"<code>{format_size(file_size)}</code>"))
+    fields.append(("INFO", "anadiendo a la cola..."))
+
+    status = await message.reply_text(_render_box("RECEIVED", fields))
     job = QueuedJob(
         user_id=uid, chat_id=message.chat.id, msg_id=status.id, kind="file",
         original_name=original_name, original_msg_id=message.id,
@@ -977,18 +1013,22 @@ async def handle_media(client, message):
     try:
         position = await job_queue.enqueue(job)
     except ValueError:
-        await status.edit_text("<b>Ya tienes un trabajo en curso</b>")
+        await status.edit_text(
+            _render_box("WAIT", [("INFO", "ya tienes un trabajo en curso.")])
+        )
         return
 
     if position == 1:
         await status.edit_text(
-            "<b>Eres el siguiente</b>\n\n- <i>Preparando...</i>",
+            _render_box("NEXT", [("STATUS", "preparando")]),
             reply_markup=cancel_button(uid),
         )
     else:
         await status.edit_text(
-            f"<b>En cola</b> - posicion <b>#{position}</b>\n\n"
-            f"- <i>{position - 1} delante de ti</i>",
+            _render_box("QUEUE", [
+                ("POSITION", f"#{position}"),
+                ("AHEAD",    f"{position - 1} trabajos"),
+            ]),
             reply_markup=cancel_button(uid),
         )
 
