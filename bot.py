@@ -28,7 +28,7 @@ API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 
 TELEGRAM_API_URL = os.environ.get(
-    "TELEGRAM_API_URL", "http://localhost:8081/bot")
+    "TELEGRAM_API_URL", "http://127.0.0.1:8081")
 TELEGRAM_LOCAL_MODE = os.environ.get(
     "TELEGRAM_LOCAL_MODE", "true").lower() == "true"
 
