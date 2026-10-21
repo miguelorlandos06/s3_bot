@@ -1,9 +1,10 @@
-import os, re, time, uuid, signal, asyncio, logging, shutil
+import os, re, time, uuid, signal, asyncio, logging, shutil, subprocess
 from html import escape as _html_escape
-from urllib.parse import urlparse, unquote
+from urllib.parse import urlparse, unquote, quote
 
 import aiofiles, aiohttp
 from aiohttp import web
+import yt_dlp
 
 from pyrogram import Client, filters
 from pyrogram.enums import ParseMode
@@ -13,18 +14,13 @@ from pyrogram.types import (
 from todus.client import S3Client
 
 
-# ============================================================
-# CONFIGURACION
-# ============================================================
-
 BOT_TOKEN = os.environ["BOT_TOKEN"]
 API_ID = int(os.environ["API_ID"])
 API_HASH = os.environ["API_HASH"]
 SESSION_STRING = os.environ["SESSION_STRING"]
 
 _TMP_BASE = os.environ.get("TMPDIR") or os.path.expanduser("~")
-DOWNLOAD_PATH = os.environ.get(
-    "TODUS_TMP", os.path.join(_TMP_BASE, "todus_uploads"))
+DOWNLOAD_PATH = os.environ.get("TODUS_TMP", os.path.join(_TMP_BASE, "todus_uploads"))
 
 PORT = int(os.environ.get("PORT", 10000))
 MAX_FILE_SIZE = 2000 * 1024 * 1024
@@ -35,6 +31,12 @@ WATCHDOG_LIFETIME = 13800
 PARALLEL_URL_DOWNLOAD = True
 PARALLEL_URL_PARTS = 4
 PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
+
+YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "cookies.txt")
+YOUTUBE_HOSTS_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.IGNORECASE)
+PENDING_TTL = 300
+MAX_AUDIO_BUTTONS = 8
+MAX_VIDEO_BUTTONS = 10
 
 BROWSER_HEADERS = {
     "User-Agent": (
@@ -69,10 +71,6 @@ app = Client(
 )
 
 
-# ============================================================
-# HELPERS
-# ============================================================
-
 def h(text):
     return _html_escape(str(text), quote=False)
 
@@ -96,15 +94,20 @@ def progress_bar(pct, width=15):
 
 
 def humanize_error(exc):
+    if isinstance(exc, asyncio.TimeoutError):
+        return "Tiempo de espera agotado."
+    if isinstance(exc, aiohttp.ClientResponseError):
+        if exc.status == 403: return "El servidor rechazo la descarga (403)."
+        if exc.status == 404: return "La URL no existe o fue eliminada (404)."
+        if exc.status == 429: return "Servidor limitando peticiones (429)."
+        return f"Error HTTP {exc.status}."
     s = str(exc).lower()
     if "no space left" in s: return "El servidor no tiene espacio temporal."
-    if "http 403" in s or "forbidden" in s: return "El servidor rechazo la descarga (403)."
-    if "http 404" in s or "not found" in s: return "La URL no existe o fue eliminada (404)."
-    if "http 429" in s or "too many requests" in s: return "Servidor limitando peticiones (429)."
-    if "timeout" in s or "timed out" in s: return "Tiempo de espera agotado."
     if "supera el limite" in s or "too large" in s: return "El archivo supera el limite."
-    if "range" in s: return "El servidor no soporta descarga en paralelo."
+    if "range" in s and "not support" in s: return "El servidor no soporta descarga en paralelo."
     if "connection" in s or "connect" in s: return "No se pudo conectar con el origen."
+    if "signature" in s or "extractor" in s: return "YouTube rechazo la extraccion (cookies o yt-dlp desactualizado)."
+    if "quickjs" in s or "js runtime" in s: return "Falta QuickJS o es demasiado antiguo."
     return f"Error inesperado: {h(str(exc)[:150])}"
 
 
@@ -112,17 +115,20 @@ PHASE_TITLES = {
     "Descargando": "DOWNLOADING",
     "Descargando de Telegram": "DOWNLOADING FROM TELEGRAM",
     "Subiendo": "UPLOADING",
+    "Descargando YouTube": "DOWNLOADING YOUTUBE",
 }
 
 
 def _render_box(title, fields):
-    """Caja cerrada: ┎ arriba, ┠ en medio, ┖ al final. Ultimo campo siempre en ┖."""
     total = len(fields)
     lines = [f"\u250e {title}"]
     for i, (key, val) in enumerate(fields):
         prefix = "\u2516" if i == total - 1 else "\u2520"
         val = str(val).replace("\n", " ").replace("\r", " ")
-        lines.append(f"{prefix} {key}: {val}")
+        if key == "":
+            lines.append(f"{prefix} {val}")
+        else:
+            lines.append(f"{prefix} {key}: {val}")
     return "\n".join(lines)
 
 
@@ -139,11 +145,6 @@ def render_progress(phase, current, total, tracker=None, filename="", extra=""):
     fields.append(("PERCENTAGE", f"{pct}%"))
     fields.append(("SIZE", f"{format_size(current)}/{format_size(total)}"))
     return _render_box(title, fields)
-
-
-def _fix_progress_format(text):
-    """Reemplaza el hueco ' : [bar]' por ' [bar]' para que la barra no lleve clave."""
-    return text.replace("\u2520 : [", "\u2520 [").replace("\u2516 : [", "\u2516 [")
 
 
 class ProgressTracker:
@@ -180,14 +181,17 @@ def sanitize_filename(name):
     return name.strip("._") or f"file_{int(time.time())}"
 
 
-def check_disk_space():
+def check_disk_space(needed_bytes=0):
     try:
         free = shutil.disk_usage(DOWNLOAD_PATH).free
     except Exception:
         return
-    min_free = 512 * 1024 * 1024
-    if free < min_free:
-        raise RuntimeError(f"Disco insuficiente: {format_size(free)} libres")
+    required = needed_bytes + 512 * 1024 * 1024
+    if free < required:
+        raise RuntimeError(
+            f"Disco insuficiente: {format_size(free)} libres, "
+            f"se necesitan {format_size(required)}"
+        )
 
 
 def cancel_button(uid):
@@ -196,9 +200,21 @@ def cancel_button(uid):
     ]])
 
 
-# ============================================================
-# EDITOR CON THROTTLE
-# ============================================================
+def check_quickjs():
+    try:
+        out = subprocess.check_output(
+            ["qjs", "--version"], text=True, stderr=subprocess.STDOUT
+        ).strip()
+    except FileNotFoundError:
+        return False, "qjs no encontrado en PATH"
+    m = re.search(r"(\d+)\.(\d+)\.(\d+)", out)
+    if not m:
+        return False, out
+    major, minor = int(m.group(1)), int(m.group(2))
+    if "ng" in out.lower():
+        return (major, minor) >= (0, 12), out
+    return major >= 2025, out
+
 
 class EditState:
     def __init__(self):
@@ -212,7 +228,6 @@ _edit_locks = {}
 
 async def edit_status(client, chat_id, msg_id, text, force=False):
     key = (chat_id, msg_id)
-    text = _fix_progress_format(text)
     state = _edit_states.setdefault(key, EditState())
     lock = _edit_locks.setdefault(key, asyncio.Lock())
     async with lock:
@@ -245,10 +260,6 @@ async def notify_processing(job):
     except Exception:
         pass
 
-
-# ============================================================
-# SUBIDA A S3 CON PROGRESO REAL
-# ============================================================
 
 async def subir_a_s3(temp_path, filename, size, on_progress=None):
     from todus.constants import guess_content_type
@@ -285,10 +296,6 @@ async def subir_a_s3(temp_path, filename, size, on_progress=None):
 
     return await asyncio.to_thread(_do_upload)
 
-
-# ============================================================
-# JOB QUEUE
-# ============================================================
 
 class QueuedJob:
     __slots__ = ("job_id", "user_id", "chat_id", "msg_id", "kind", "url",
@@ -385,8 +392,11 @@ class JobQueue:
         while True:
             job = await self.queue.get()
             try:
-                if job.cancel_requested: continue
-                if job.job_id not in [j.job_id for j in self.pending_order]: continue
+                if job.cancel_requested:
+                    continue
+                async with self._lock:
+                    if job.job_id not in [j.job_id for j in self.pending_order]:
+                        continue
                 await self.mark_active(job)
                 await notify_processing(job)
                 job.task = asyncio.create_task(process_fn(job))
@@ -440,10 +450,6 @@ class JobQueue:
 
 job_queue = JobQueue(QUEUE_WORKERS)
 
-
-# ============================================================
-# DESCARGA
-# ============================================================
 
 async def _download_sequential(session, url, temp_path, total, job, filename):
     downloaded = 0
@@ -508,6 +514,7 @@ async def _download_parallel(session, url, temp_path, total, job, filename):
 
     part_paths = await asyncio.gather(*[download_part(i, s, e) for i, s, e in parts])
 
+    written = 0
     async with aiofiles.open(temp_path, "wb") as out:
         for p in part_paths:
             async with aiofiles.open(p, "rb") as src:
@@ -515,14 +522,99 @@ async def _download_parallel(session, url, temp_path, total, job, filename):
                     chunk = await src.read(8 * 1024 * 1024)
                     if not chunk: break
                     await out.write(chunk)
+                    written += len(chunk)
             try: os.unlink(p)
             except Exception: pass
+    if written != total:
+        raise RuntimeError(f"Tamano final incorrecto: {written} != {total}")
     return total
 
 
-# ============================================================
-# PROCESAMIENTO
-# ============================================================
+def _ytdlp_base_opts():
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "js_runtimes": ["quickjs"],
+        "remote_components": ["ejs:github"],
+    }
+    if os.path.exists(YTDLP_COOKIES):
+        opts["cookiefile"] = YTDLP_COOKIES
+    return opts
+
+
+def _extract_formats_split(url: str):
+    opts = _ytdlp_base_opts()
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+
+    duration = info.get("duration") or 0
+    if duration > 1800:
+        raise RuntimeError("Video demasiado largo (max 30 min) para esta red.")
+
+    title = info.get("title", "Video")
+    audio, video = [], []
+
+    for f in info.get("formats", []):
+        vcodec = f.get("vcodec") or "none"
+        acodec = f.get("acodec") or "none"
+        ext = f.get("ext") or "?"
+        size = f.get("filesize") or f.get("filesize_approx") or 0
+        fid = f["format_id"]
+
+        if acodec != "none" and vcodec == "none":
+            audio.append({
+                "format_id": fid,
+                "ext": ext,
+                "abr": f.get("abr") or 0,
+                "filesize": size,
+            })
+        elif vcodec != "none":
+            needs_merge = acodec == "none"
+            final_id = fid if not needs_merge else f"{fid}+bestaudio[ext=m4a]/bestaudio"
+            video.append({
+                "format_id": final_id,
+                "ext": ext,
+                "resolution": f.get("resolution") or f"{f.get('height', '?')}p",
+                "height": f.get("height") or 0,
+                "filesize": size,
+                "needs_merge": needs_merge,
+            })
+
+    audio.sort(key=lambda x: x["abr"], reverse=True)
+    video.sort(key=lambda x: x["height"], reverse=True)
+
+    return title, audio[:MAX_AUDIO_BUTTONS], video[:MAX_VIDEO_BUTTONS]
+
+
+def _download_youtube_format(url: str, format_id: str, on_progress=None):
+    outtmpl = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}_%(title).80s.%(ext)s")
+    opts = _ytdlp_base_opts()
+    opts.update({
+        "format": format_id,
+        "outtmpl": outtmpl,
+        "merge_output_format": "mp4",
+        "noplaylist": True,
+    })
+
+    def _hook(d):
+        if on_progress and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            if total:
+                on_progress(done, total)
+
+    opts["progress_hooks"] = [_hook]
+
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        if not os.path.exists(path):
+            base, _ = os.path.splitext(path)
+            for ext in (".mp4", ".mkv", ".webm", ".m4a", ".opus"):
+                if os.path.exists(base + ext):
+                    return base + ext
+        return path
+
 
 async def process_job(job):
     if job.kind == "url":
@@ -576,6 +668,8 @@ async def _process_url(job):
                     pass
                 if total and total > MAX_FILE_SIZE:
                     raise RuntimeError(f"Archivo {format_size(total)} supera el limite")
+                if total:
+                    check_disk_space(total)
 
                 max_retries = 3
                 for attempt in range(max_retries):
@@ -696,17 +790,13 @@ async def _process_file(job):
         except Exception: pass
 
 
-# ============================================================
-# HANDLERS
-# ============================================================
-
 @app.on_message(filters.command("start"))
 async def cmd_start(client, message):
     await message.reply_text(
         _render_box("TODUS UPLOADER", [
             ("INFO",  "sube archivos y URLs a s3.todus.cu/stream"),
-            ("USO",   "enviame un archivo (hasta 2 GB) o un enlace directo"),
-            ("NOTA",  "solo enlaces directos. No soporto YouTube, Mega ni similares."),
+            ("USO",   "enviame un archivo (hasta 2 GB), un enlace directo o YouTube"),
+            ("NOTA",  "YouTube: eliges audio o video y luego la calidad."),
         ])
         + "\n\n"
         + _render_box("COMANDOS", [
@@ -720,6 +810,7 @@ async def cmd_start(client, message):
 @app.on_message(filters.command("cancel"))
 async def cmd_cancel(client, message):
     uid = message.from_user.id
+    _pending_youtube.pop(uid, None)
     result = await job_queue.cancel_user(uid)
     if result == "none":
         await message.reply_text(_render_box("CANCEL", [("INFO", "no tienes nada en curso ni en cola.")]))
@@ -735,6 +826,7 @@ async def on_cancel_callback(client, callback_query):
     if callback_query.from_user.id != uid:
         await callback_query.answer("Solo el dueno puede cancelar.", show_alert=True)
         return
+    _pending_youtube.pop(uid, None)
     result = await job_queue.cancel_user(uid)
     if result == "none":
         await callback_query.answer("No tienes trabajos.", show_alert=True)
@@ -772,15 +864,271 @@ async def cmd_status(client, message):
         )
 
 
+_pending_youtube = {}
+
+
+def _cleanup_pending():
+    now = time.time()
+    for uid in list(_pending_youtube):
+        if now - _pending_youtube[uid]["ts"] > PENDING_TTL:
+            _pending_youtube.pop(uid, None)
+
+
+def _fmt_label_audio(f):
+    abr = f"{int(f['abr'])}k" if f["abr"] else "?"
+    size = format_size(f["filesize"]) if f["filesize"] else "tamano ?"
+    return f"{f['ext']} {abr} | {size}"
+
+
+def _fmt_label_video(f):
+    size = format_size(f["filesize"]) if f["filesize"] else "tamano ?"
+    suffix = " +audio" if f["needs_merge"] else ""
+    return f"{f['resolution']} | {size}{suffix}"
+
+
+async def _handle_youtube(message, url):
+    uid = message.from_user.id
+    _cleanup_pending()
+
+    if job_queue.has_user_job(uid):
+        await message.reply_text(_render_box("WAIT", [("INFO", "ya tienes un trabajo en curso. Espera o usa /cancel.")]))
+        return
+
+    status = await message.reply_text(
+        _render_box("ANALYZING", [("INFO", "extrayendo formatos...")])
+    )
+    try:
+        title, audio, video = await asyncio.to_thread(_extract_formats_split, url)
+    except Exception as e:
+        log.exception("extract formats fallo")
+        await status.edit_text(_render_box("ERROR", [("CAUSE", humanize_error(e))]))
+        return
+
+    if not audio and not video:
+        await status.edit_text(_render_box("ERROR", [("INFO", "no se encontraron formatos.")]))
+        return
+
+    _pending_youtube[uid] = {
+        "url": url, "title": title, "audio": audio, "video": video,
+        "ts": time.time(), "chat_id": message.chat.id, "msg_id": status.id,
+    }
+
+    buttons = []
+    if audio:
+        buttons.append(InlineKeyboardButton(
+            "🎵 Audio", callback_data=f"yt|kind|{uid}|audio"))
+    if video:
+        buttons.append(InlineKeyboardButton(
+            "🎬 Video", callback_data=f"yt|kind|{uid}|video"))
+
+    await status.edit_text(
+        _render_box("YOUTUBE", [
+            ("TITLE", h(title[:60])),
+            ("INFO", "elige tipo de descarga"),
+        ]),
+        reply_markup=InlineKeyboardMarkup([buttons]),
+    )
+
+
+@app.on_callback_query(filters.regex(r"^yt\|kind\|(\d+)\|(audio|video)$"))
+async def on_youtube_kind(client, callback_query):
+    _, _, uid_str, kind = callback_query.data.split("|")
+    uid = int(uid_str)
+
+    if callback_query.from_user.id != uid:
+        await callback_query.answer("No es tu seleccion.", show_alert=True)
+        return
+
+    _cleanup_pending()
+    pending = _pending_youtube.get(uid)
+    if not pending:
+        await callback_query.answer("Sesion expirada. Envia el enlace de nuevo.", show_alert=True)
+        return
+
+    items = pending["audio"] if kind == "audio" else pending["video"]
+    if not items:
+        await callback_query.answer("No hay formatos de ese tipo.", show_alert=True)
+        return
+
+    rows = []
+    for f in items:
+        label = _fmt_label_audio(f) if kind == "audio" else _fmt_label_video(f)
+        fid_encoded = quote(f["format_id"], safe="")
+        rows.append([InlineKeyboardButton(
+            label, callback_data=f"yt|fmt|{uid}|{fid_encoded}")])
+
+    rows.append([InlineKeyboardButton("🔙 Volver", callback_data=f"yt|back|{uid}")])
+
+    header = _render_box("YOUTUBE", [
+        ("TITLE", h(pending["title"][:60])),
+        ("KIND", kind.upper()),
+        ("INFO", "elige calidad"),
+    ])
+    await callback_query.answer()
+    try:
+        await client.edit_message_text(
+            callback_query.message.chat.id, callback_query.message.id,
+            header, reply_markup=InlineKeyboardMarkup(rows),
+        )
+    except Exception:
+        pass
+
+
+@app.on_callback_query(filters.regex(r"^yt\|back\|(\d+)$"))
+async def on_youtube_back(client, callback_query):
+    uid = int(callback_query.data.split("|")[2])
+    if callback_query.from_user.id != uid:
+        await callback_query.answer("No es tu seleccion.", show_alert=True)
+        return
+    _cleanup_pending()
+    pending = _pending_youtube.get(uid)
+    if not pending:
+        await callback_query.answer("Sesion expirada.", show_alert=True)
+        return
+
+    buttons = []
+    if pending["audio"]:
+        buttons.append(InlineKeyboardButton("🎵 Audio", callback_data=f"yt|kind|{uid}|audio"))
+    if pending["video"]:
+        buttons.append(InlineKeyboardButton("🎬 Video", callback_data=f"yt|kind|{uid}|video"))
+
+    await callback_query.answer()
+    try:
+        await client.edit_message_text(
+            callback_query.message.chat.id, callback_query.message.id,
+            _render_box("YOUTUBE", [
+                ("TITLE", h(pending["title"][:60])),
+                ("INFO", "elige tipo de descarga"),
+            ]),
+            reply_markup=InlineKeyboardMarkup([buttons]),
+        )
+    except Exception:
+        pass
+
+
+@app.on_callback_query(filters.regex(r"^yt\|fmt\|(\d+)\|(.+)$"))
+async def on_youtube_format(client, callback_query):
+    _, _, uid_str, fid_encoded = callback_query.data.split("|", 3)
+    uid = int(uid_str)
+    format_id = unquote(fid_encoded)
+
+    if callback_query.from_user.id != uid:
+        await callback_query.answer("No es tu seleccion.", show_alert=True)
+        return
+
+    _cleanup_pending()
+    pending = _pending_youtube.pop(uid, None)
+    if not pending:
+        await callback_query.answer("Sesion expirada. Envia el enlace de nuevo.", show_alert=True)
+        return
+
+    if job_queue.has_user_job(uid):
+        await callback_query.answer("Ya tienes un trabajo en curso.", show_alert=True)
+        return
+
+    chat_id = callback_query.message.chat.id
+    msg_id = callback_query.message.id
+
+    await callback_query.answer("Descargando...")
+    await edit_status(
+        client, chat_id, msg_id,
+        _render_box("YOUTUBE", [("FORMAT", format_id), ("STATUS", "descargando...")]),
+        force=True,
+    )
+
+    filepath = None
+    try:
+        tracker = ProgressTracker()
+
+        loop = asyncio.get_running_loop()
+        last = [0.0]
+
+        def _hook(done, total):
+            now = time.time()
+            if now - last[0] < 1.5 and done < total:
+                return
+            last[0] = now
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    edit_status(
+                        client, chat_id, msg_id,
+                        render_progress("Descargando YouTube", done, total,
+                                        filename=pending["title"][:50]),
+                    ),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        filepath = await asyncio.to_thread(
+            _download_youtube_format, pending["url"], format_id, _hook
+        )
+
+        size = os.path.getsize(filepath)
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(f"Archivo {format_size(size)} supera el limite de 2 GB")
+
+        filename = sanitize_filename(os.path.basename(filepath))
+        ext = os.path.splitext(filename)[1] or ".bin"
+        if ext == ".bin":
+            filename = filename + ".mp4"
+
+        check_disk_space(0)
+
+        await edit_status(
+            client, chat_id, msg_id,
+            render_progress("Subiendo", 0, size, filename=filename),
+            force=True,
+        )
+
+        async def on_up(sent, total):
+            await edit_status(
+                client, chat_id, msg_id,
+                render_progress("Subiendo", sent, total, filename=filename),
+            )
+
+        upload_url = await subir_a_s3(filepath, filename, size, on_up)
+
+        await client.edit_message_text(
+            chat_id, msg_id,
+            _success_message(filename, size, tracker.get_elapsed(), upload_url),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("DESCARGAR", url=upload_url)
+            ]]),
+        )
+    except asyncio.CancelledError:
+        try:
+            await client.edit_message_text(chat_id, msg_id, _cancel_message("youtube"))
+        except Exception: pass
+        raise
+    except Exception as e:
+        log.exception("youtube download/upload fallo")
+        try:
+            await client.edit_message_text(
+                chat_id, msg_id,
+                _render_box("ERROR", [("CAUSE", humanize_error(e))]),
+            )
+        except Exception: pass
+    finally:
+        if filepath:
+            try: os.unlink(filepath)
+            except Exception: pass
+
+
 @app.on_message(filters.text & ~filters.command(["start", "cancel", "status"]))
 async def handle_text(client, message):
     uid = message.from_user.id
     url = extract_url(message.text)
     if not url:
         await message.reply_text(_render_box("ERROR", [
-            ("INFO", f"enviame un enlace directo o un archivo (maximo {format_size(MAX_FILE_SIZE)})."),
+            ("INFO", f"enviame un enlace directo, de YouTube o un archivo (maximo {format_size(MAX_FILE_SIZE)})."),
         ]))
         return
+
+    if YOUTUBE_HOSTS_RE.search(url):
+        await _handle_youtube(message, url)
+        return
+
     if job_queue.has_user_job(uid):
         await message.reply_text(_render_box("WAIT", [("INFO", "ya tienes un trabajo en curso. Espera o usa /cancel.")]))
         return
@@ -871,10 +1219,6 @@ async def handle_media(client, message):
         ]), reply_markup=cancel_button(uid))
 
 
-# ============================================================
-# HEALTH SERVER
-# ============================================================
-
 START_TIME = time.time()
 
 
@@ -884,6 +1228,7 @@ async def health_handler(request):
         "uptime": round(time.time() - START_TIME, 1),
         "queue_queued": job_queue.queued_count,
         "queue_active": job_queue.active_count,
+        "pending_youtube": len(_pending_youtube),
     })
 
 
@@ -907,10 +1252,6 @@ async def run_web():
     return runner
 
 
-# ============================================================
-# WATCHDOG
-# ============================================================
-
 async def watchdog():
     while True:
         await asyncio.sleep(30)
@@ -923,11 +1264,13 @@ async def watchdog():
             os._exit(0)
 
 
-# ============================================================
-# ARRANQUE
-# ============================================================
-
 async def main():
+    ok, ver = check_quickjs()
+    if not ok:
+        log.warning(f"QuickJS: {ver} - YouTube puede fallar.")
+    else:
+        log.info(f"QuickJS OK: {ver}")
+
     web_runner = await run_web()
     await app.start()
     job_queue.start_workers(process_job)

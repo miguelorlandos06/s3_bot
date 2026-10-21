@@ -47,5 +47,5 @@ class NamespaceAlreadyExistsError(NamespaceError):
     pass
 
 
-class FileNotFoundError(ToDusNotFoundError):
+class ToDusFileNotFoundError(ToDusNotFoundError):
     pass

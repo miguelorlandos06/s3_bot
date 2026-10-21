@@ -4,3 +4,4 @@ aiohttp>=3.10.0
 aiofiles>=23.2.1
 requests>=2.25
 tqdm>=4.50
+yt-dlp>=2024.0.0

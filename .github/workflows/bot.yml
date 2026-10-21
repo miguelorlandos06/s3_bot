@@ -9,7 +9,7 @@ on:
 
 concurrency:
   group: todus-bot
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   run-bot:
@@ -23,10 +23,28 @@ jobs:
         with:
           python-version-file: '.python-version'
 
-      - name: Install dependencies
+      - name: Install system deps (quickjs, ffmpeg)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          curl -L -o /tmp/qjs.tar.xz \
+            https://github.com/quickjs-ng/quickjs/releases/download/v0.10.1/qjs-linux-x86_64.tar.xz || true
+          if [ -f /tmp/qjs.tar.xz ]; then
+            tar -xf /tmp/qjs.tar.xz -C /tmp || true
+            find /tmp -name qjs -type f -exec sudo cp {} /usr/local/bin/qjs \; || true
+            sudo chmod +x /usr/local/bin/qjs || true
+          fi
+          qjs --version || echo "qjs no disponible, YouTube puede fallar"
+
+      - name: Install Python deps
         run: |
           pip install --upgrade pip
           pip install -r requirements.txt
+          pip install -U yt-dlp
+
+      - name: Decode yt-dlp cookies
+        if: ${{ secrets.YTDLP_COOKIES_B64 != '' }}
+        run: echo "${{ secrets.YTDLP_COOKIES_B64 }}" | base64 -d > cookies.txt
 
       - name: Run bot
         env:
@@ -34,4 +52,5 @@ jobs:
           API_ID: ${{ secrets.API_ID }}
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
+          YTDLP_COOKIES: cookies.txt
         run: python bot.py
