@@ -26,7 +26,7 @@ jobs:
       - name: Install system deps (quickjs, ffmpeg)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg qjs
+          sudo apt-get install -y ffmpeg quickjs
           qjs --version
 
       - name: Install Python deps
