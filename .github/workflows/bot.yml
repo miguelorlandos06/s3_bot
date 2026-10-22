@@ -43,8 +43,10 @@ jobs:
           pip install -U yt-dlp
 
       - name: Decode yt-dlp cookies
-        if: ${{ secrets.YTDLP_COOKIES_B64 != '' }}
-        run: echo "${{ secrets.YTDLP_COOKIES_B64 }}" | base64 -d > cookies.txt
+        if: env.YTDLP_COOKIES_B64 != ''
+        env:
+          YTDLP_COOKIES_B64: ${{ secrets.YTDLP_COOKIES_B64 }}
+        run: echo "$YTDLP_COOKIES_B64" | base64 -d > cookies.txt
 
       - name: Run bot
         env:
