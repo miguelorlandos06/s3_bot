@@ -23,10 +23,14 @@ jobs:
         with:
           python-version: '3.12'
 
-      - name: Install system deps (quickjs, ffmpeg)
+      - name: Install system deps (quickjs-ng, ffmpeg)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg quickjs
+          sudo apt-get install -y ffmpeg build-essential git
+          git clone --depth 1 https://github.com/quickjs-ng/quickjs.git /tmp/qjs-src
+          cd /tmp/qjs-src
+          make
+          sudo cp qjs /usr/local/bin/qjs
           qjs --version
 
       - name: Install Python deps
