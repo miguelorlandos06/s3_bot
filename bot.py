@@ -34,6 +34,8 @@ PARALLEL_URL_MIN_SIZE = 50 * 1024 * 1024
 
 YTDLP_COOKIES = os.environ.get("YTDLP_COOKIES", "cookies.txt")
 YOUTUBE_HOSTS_RE = re.compile(r"(youtube\.com|youtu\.be|music\.youtube\.com)", re.IGNORECASE)
+FACEBOOK_HOSTS_RE = re.compile(r"(facebook\.com|fb\.watch|fb\.me)", re.IGNORECASE)
+FB_COOKIES = os.environ.get("FB_COOKIES", "cookies_fb.txt")
 PENDING_TTL = 300
 MAX_AUDIO_BUTTONS = 8
 MAX_VIDEO_BUTTONS = 10
@@ -616,6 +618,117 @@ def _download_youtube_format(url: str, format_id: str, on_progress=None):
         return path
 
 
+def _download_facebook(url: str, on_progress=None):
+    outtmpl = os.path.join(DOWNLOAD_PATH, f"{uuid.uuid4().hex}_%(title).80s.%(ext)s")
+    opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "outtmpl": outtmpl,
+        "format": "hd+bestaudio/hd/sd/best[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best",
+        "merge_output_format": "mp4",
+    }
+    if os.path.exists(FB_COOKIES):
+        opts["cookiefile"] = FB_COOKIES
+
+    def _hook(d):
+        if on_progress and d.get("status") == "downloading":
+            total = d.get("total_bytes") or d.get("total_bytes_estimate") or 0
+            done = d.get("downloaded_bytes") or 0
+            if total:
+                on_progress(done, total)
+
+    opts["progress_hooks"] = [_hook]
+    with yt_dlp.YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        path = ydl.prepare_filename(info)
+        if not os.path.exists(path):
+            base, _ = os.path.splitext(path)
+            for ext in (".mp4", ".mkv", ".webm"):
+                if os.path.exists(base + ext):
+                    return base + ext
+        return path
+
+
+async def _handle_facebook(message, url):
+    uid = message.from_user.id
+    if job_queue.has_user_job(uid):
+        await message.reply_text(_render_box("WAIT", [("INFO", "ya tienes un trabajo en curso.")]))
+        return
+
+    status = await message.reply_text(
+        _render_box("FACEBOOK", [("INFO", "descargando...")])
+    )
+    filepath = None
+    try:
+        loop = asyncio.get_running_loop()
+        last = [0.0]
+
+        def _hook(done, total):
+            now = time.time()
+            if now - last[0] < 1.5 and done < total:
+                return
+            last[0] = now
+            try:
+                asyncio.run_coroutine_threadsafe(
+                    edit_status(
+                        app, status.chat.id, status.id,
+                        render_progress("Descargando", done, total, filename="facebook"),
+                    ),
+                    loop,
+                )
+            except Exception:
+                pass
+
+        filepath = await asyncio.to_thread(_download_facebook, url, _hook)
+        size = os.path.getsize(filepath)
+        if size > MAX_FILE_SIZE:
+            raise RuntimeError(f"Archivo {format_size(size)} supera el limite de 2 GB")
+
+        filename = sanitize_filename(os.path.basename(filepath))
+        tracker = ProgressTracker()
+
+        await edit_status(
+            app, status.chat.id, status.id,
+            render_progress("Subiendo", 0, size, filename=filename),
+            force=True,
+        )
+
+        async def on_up(sent, total):
+            await edit_status(
+                app, status.chat.id, status.id,
+                render_progress("Subiendo", sent, total, filename=filename),
+            )
+
+        upload_url = await subir_a_s3(filepath, filename, size, on_up)
+
+        await app.edit_message_text(
+            status.chat.id, status.id,
+            _success_message(filename, size, tracker.get_elapsed(), upload_url),
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("DESCARGAR", url=upload_url)
+            ]]),
+        )
+    except asyncio.CancelledError:
+        try:
+            await app.edit_message_text(status.chat.id, status.id, _cancel_message("facebook"))
+        except Exception:
+            pass
+        raise
+    except Exception as e:
+        log.exception("facebook fallo")
+        try:
+            await app.edit_message_text(
+                status.chat.id, status.id,
+                _render_box("ERROR", [("CAUSE", humanize_error(e))]),
+            )
+        except Exception:
+            pass
+    finally:
+        if filepath:
+            try: os.unlink(filepath)
+            except Exception: pass
+
+
 async def process_job(job):
     if job.kind == "url":
         await _process_url(job)
@@ -1127,6 +1240,10 @@ async def handle_text(client, message):
 
     if YOUTUBE_HOSTS_RE.search(url):
         await _handle_youtube(message, url)
+        return
+
+    if FACEBOOK_HOSTS_RE.search(url):
+        await _handle_facebook(message, url)
         return
 
     if job_queue.has_user_job(uid):

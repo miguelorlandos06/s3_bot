@@ -39,11 +39,17 @@ jobs:
           pip install -r requirements.txt
           pip install -U yt-dlp
 
-      - name: Decode yt-dlp cookies
-        if: env.YTDLP_COOKIES_B64 != ''
+      - name: Decode cookies (YouTube + Facebook)
         env:
           YTDLP_COOKIES_B64: ${{ secrets.YTDLP_COOKIES_B64 }}
-        run: echo "$YTDLP_COOKIES_B64" | base64 -d > cookies.txt
+          FB_COOKIES_B64: ${{ secrets.FB_COOKIES_B64 }}
+        run: |
+          if [ -n "$YTDLP_COOKIES_B64" ]; then
+            echo "$YTDLP_COOKIES_B64" | base64 -d > cookies.txt
+          fi
+          if [ -n "$FB_COOKIES_B64" ]; then
+            echo "$FB_COOKIES_B64" | base64 -d > cookies_fb.txt
+          fi
 
       - name: Run bot
         env:
@@ -52,5 +58,6 @@ jobs:
           API_HASH: ${{ secrets.API_HASH }}
           SESSION_STRING: ${{ secrets.SESSION_STRING }}
           YTDLP_COOKIES: cookies.txt
+          FB_COOKIES: cookies_fb.txt
         run: python bot.py
 # Wed Oct 21 22:09:56 CDT 2026
