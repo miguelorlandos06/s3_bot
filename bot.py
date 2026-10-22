@@ -534,7 +534,7 @@ def _ytdlp_base_opts():
     opts = {
         "quiet": True,
         "no_warnings": True,
-        "js_runtimes": ["quickjs"],
+        "js_runtimes": {"quickjs": {}},
         "remote_components": ["ejs:github"],
     }
     if os.path.exists(YTDLP_COOKIES):
