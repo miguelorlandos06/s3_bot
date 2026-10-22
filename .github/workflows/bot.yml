@@ -26,15 +26,8 @@ jobs:
       - name: Install system deps (quickjs, ffmpeg)
         run: |
           sudo apt-get update
-          sudo apt-get install -y ffmpeg
-          curl -L -o /tmp/qjs.tar.xz \
-            https://github.com/quickjs-ng/quickjs/releases/download/v0.10.1/qjs-linux-x86_64.tar.xz || true
-          if [ -f /tmp/qjs.tar.xz ]; then
-            tar -xf /tmp/qjs.tar.xz -C /tmp || true
-            find /tmp -name qjs -type f -exec sudo cp {} /usr/local/bin/qjs \; || true
-            sudo chmod +x /usr/local/bin/qjs || true
-          fi
-          qjs --version || echo "qjs no disponible, YouTube puede fallar"
+          sudo apt-get install -y ffmpeg qjs
+          qjs --version
 
       - name: Install Python deps
         run: |
