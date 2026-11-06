@@ -31,7 +31,9 @@ jobs:
       - name: Clonar e instalar picta-dlp
         timeout-minutes: 5
         run: |
-          git clone https://github.com/miguelorlandos06/picta-dlp.git /tmp/picta-dlp
+          # Evitar que git pida credenciales para un repo público
+          export GIT_TERMINAL_PROMPT=0
+          git clone --depth 1 https://github.com/miguelorlandos06/picta-dlp.git /tmp/picta-dlp
           cd /tmp/picta-dlp
           python -m pip install -v .
 
