@@ -1,0 +1,62 @@
+name: Node Bot
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+
+concurrency:
+  group: s3-bot
+  cancel-in-progress: false
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 235
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+
+      - name: Instalar yt-dlp y ffmpeg
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg python3-pip
+          python3 -m pip install -U "yt-dlp[default,curl-cffi]"
+
+      - name: Instalar picta-dlp (privado)
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          python3 -m pip install -U "git+https://${GH_TOKEN}@github.com/miguelorlandos06/picta-dlp.git"
+
+      - name: Instalar dependencias de Node
+        run: npm install
+
+      - name: Preparar cookies yt-dlp
+        run: |
+          if [ -n "${{ secrets.YTDLP_COOKIES_B64 }}" ]; then
+            echo "${{ secrets.YTDLP_COOKIES_B64 }}" | base64 -d > "$RUNNER_TEMP/cookies.txt"
+            echo "YTDLP_COOKIES=$RUNNER_TEMP/cookies.txt" >> "$GITHUB_ENV"
+          fi
+
+      - name: Run bot
+        env:
+          BOT_TOKEN: ${{ secrets.BOT_TOKEN }}
+          TODUS_TMP: ${{ runner.temp }}/todus
+          S3_BASE_URL: https://s3.todus.cu
+          YTDLP_IMPERSONATE: chrome
+          PICTA_USER: ${{ secrets.PICTA_USER }}
+          PICTA_PASS: ${{ secrets.PICTA_PASS }}
+        run: |
+          mkdir -p "$TODUS_TMP"
+          node index.js
+
+      - name: Relanzar bot automáticamente
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          sleep 10
+          gh workflow run bot.yml --ref main
