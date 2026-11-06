@@ -19,6 +19,7 @@ const YTDLP_IMPERSONATE = process.env.YTDLP_IMPERSONATE || "chrome";
 
 const PICTA_USER = process.env.PICTA_USER;
 const PICTA_PASS = process.env.PICTA_PASS;
+const PICTA_CLIENT_ID = "ebkU3YeFu3So9hesQHrS8AZjEa4v7TiYbS5QZIgO";
 
 if (!fs.existsSync(TMP_DIR)) fs.mkdirSync(TMP_DIR, { recursive: true });
 
@@ -63,41 +64,87 @@ function ytdlpArgs(extra = []) {
   return args;
 }
 
-// --- Picta (usando picta-dlp con timeout) ---
-async function getPictaInfo(url) {
-  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "-J", url], { maxBuffer: 64 * 1024 * 1024, timeout: 60000 });
-  return JSON.parse(stdout);
+// --- Picta API (Metadatos y Manifiesto) ---
+async function getPictaToken() {
+  const form = new FormData();
+  form.append("grant_type", "password"); form.append("client_id", PICTA_CLIENT_ID);
+  form.append("username", PICTA_USER); form.append("password", PICTA_PASS);
+  const res = await fetch("https://api.picta.cu/o/token/", { method: "POST", body: form, headers: { "User-Agent": "Mozilla/5.0" } });
+  return (await res.json()).access_token;
 }
-async function getPictaQualities(url) {
-  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "-F", url], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
+
+async function getPictaApiData(slug) {
+  const token = await getPictaToken();
+  const res = await fetch(`https://api.picta.cu/v2/publicacion/?format=json&slug_url_raw=${slug}`, {
+    headers: { "Authorization": `Bearer ${token}`, "X-Device-Id": "1165077", "Accept": "application/json" }
+  });
+  const data = await res.json();
+  if (!data.results || data.results.length === 0) throw new Error("Película no encontrada en Picta.");
+  return data.results[0];
+}
+
+function extractPictaMeta(videoData) {
+  const cat = videoData.categoria || {};
+  const pel = cat.pelicula || {};
+  const cap = cat.capitulo || {};
+  const infoSerie = cap.temporada?.serie || {};
+  
+  return {
+    title: videoData.nombre,
+    thumbnail: videoData.url_imagen,
+    synopsis: videoData.descripcion || infoSerie.sinopsis || null,
+    duration: videoData.duracion,
+    year: (pel.ano || infoSerie.ano) ? String(pel.ano || infoSerie.ano) : null,
+    genres: (pel.genero || infoSerie.genero || []).map(g => '#' + g.nombre.replace(/\s+/g, '')).join(' ') || null,
+    director: (pel.director || infoSerie.director || []).map(d => d.nombre).join(', ') || null,
+    cast: (pel.reparto || infoSerie.reparto || []).slice(0, 5).map(a => a.nombre).join(', ') || null,
+    season: cap.temporada?.nombre || null,
+    episode: cap.numero ? String(cap.numero) : null,
+    rating: null,
+  };
+}
+
+// --- Picta (Calidades y Descarga con picta-dl) ---
+async function getPictaQualities(manifestUrl) {
+  const { stdout } = await execFileAsync("picta-dl", ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-F", manifestUrl], { maxBuffer: 10 * 1024 * 1024 });
   const formats = [];
   for (const line of stdout.split("\n")) {
-    const match = line.match(/(\d+)\s+video\s+(\d{3,4})x(\d{3,4})/);
-    if (match) formats.push({ id: match[1], height: parseInt(match[3], 10) });
+    const match = line.match(/(dash-\d+-\d+)\s+mp4\s+(\d{3,4})x(\d{3,4})/);
+    if (match) { formats.push({ id: match[1], height: parseInt(match[3], 10) }); }
   }
   return Array.from(new Map(formats.map(f => [f.height, f])).values()).sort((a, b) => b.height - a.height);
 }
+
 async function downloadPictaVideo(url, formatId, dest, ctx, chatId, statusMsgId, filename) {
-  const args = ["-u", PICTA_USER, "-p", PICTA_PASS, "-f", formatId, "--audio-lang", "und", "-o", dest, url];
+  const args = ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-f", formatId, "-o", dest, url];
+  const startTime = Date.now();
+  
   return new Promise((resolve, reject) => {
-    const child = execFile("picta-dlp", args, { maxBuffer: 64 * 1024 * 1024 });
-    child.on("close", (code) => code === 0 ? resolve(dest) : reject(new Error(`picta-dlp falló (${code})`)));
+    const child = execFile("picta-dl", args, { maxBuffer: 64 * 1024 * 1024 });
+    
+    // El bot lee el progreso desde los prints de picta-dl
+    child.stdout.on("data", (data) => {
+      const match = data.toString().match(/PROGRESO:(\d+)\/(\d+)/);
+      if (match) {
+        const done = parseInt(match[1], 10);
+        const total = parseInt(match[2], 10);
+        const elapsed = (Date.now() - startTime) / 1000;
+        const speed = elapsed > 0 ? done / elapsed : 0;
+        const eta = speed > 0 ? (total - done) / speed : 0;
+        
+        safeEdit(ctx, chatId, statusMsgId, renderBox("DESCARGANDO", [
+          ["NAME", escapeHtml(filename)],
+          ["", `[${progressBar((done / total) * 100)}]`],
+          ["SEGMENTOS", `${done}/${total}`],
+          ["VELOCIDAD", `${speed.toFixed(1)} seg/s`],
+          ["ETA", formatETA(eta)]
+        ]), cancelKeyboard(jobKey(chatId, statusMsgId)));
+      }
+    });
+
+    child.on("close", (code) => code === 0 ? resolve(dest) : reject(new Error(`picta-dl falló (${code})`)));
     child.on("error", reject);
   });
-}
-function extractPictaMeta(info) {
-  return {
-    title: info.title,
-    thumbnail: info.thumbnail,
-    synopsis: info.description,
-    duration: info.duration,
-    year: info.ano ? String(info.ano) : null,
-    genres: info.genero ? info.genero.map(g => '#' + g.nombre.replace(/\s+/g, '')).join(' ') : null,
-    director: info.director ? info.director.map(d => d.nombre).join(', ') : null,
-    cast: info.reparto ? info.reparto.slice(0, 5).map(a => a.nombre).join(', ') : null,
-    season: info.temporada ? info.temporada.nombre : null,
-    episode: info.capitulo ? String(info.capitulo) : null,
-  };
 }
 
 // --- YouTube ---
@@ -129,7 +176,7 @@ function extractYoutubeMeta(info) {
   };
 }
 
-// --- Descarga y S3 ---
+// --- Descarga Directa y S3 ---
 async function downloadYoutubeVideo(url, quality, dest, ctx, chatId, statusMsgId, filename) {
   const format = quality === "best" ? "bestvideo+bestaudio/best" : `bestvideo[height<=${quality}]+bestaudio/best[height<=${quality}]/best`;
   const args = ytdlpArgs(["-f", format, "--merge-output-format", "mp4", "--newline", "-o", dest, "--add-header", "User-Agent:Mozilla/5.0", url]);
@@ -193,7 +240,6 @@ async function downloadDirect(url, destPath, total, ctx, statusMsgId, filename, 
 // --- Tarjeta Final ---
 async function sendFinalCard(ctx, chatId, statusMsgId, meta, s3Url, size, qualityLabel) {
   const kb = new InlineKeyboard().url("Descargar", s3Url);
-  
   let text = `<b>${escapeHtml(meta.title)}</b>\n\n`;
   if (meta.season) text += `Temporada: ${meta.season}\n`;
   if (meta.episode) text += `Episodio: ${meta.episode}\n`;
@@ -219,7 +265,6 @@ async function sendFinalCard(ctx, chatId, statusMsgId, meta, s3Url, size, qualit
       console.error("Error al enviar foto:", e.message);
     }
   }
-
   try {
     await ctx.api.editMessageText(chatId, statusMsgId, text, { parse_mode: "HTML", reply_markup: kb });
   } catch (e) {
@@ -231,19 +276,25 @@ async function sendFinalCard(ctx, chatId, statusMsgId, meta, s3Url, size, qualit
 async function handlePicta(ctx, url) {
   const statusMsgId = (await ctx.reply(renderBox("NUVOLA", [["ORIGIN", "Picta"], ["STATUS", "Conectando..."]]))).message_id;
   try {
+    const parsedUrl = new URL(url);
+    const slug = parsedUrl.pathname.split("/").filter(Boolean).pop();
+    
+    // 1. Metadatos de la API
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("NUVOLA", [["ORIGIN", "Picta"], ["STATUS", "Buscando video..."]]));
-    const info = await getPictaInfo(url);
+    const videoData = await getPictaApiData(slug);
+    const meta = extractPictaMeta(videoData);
     
+    // 2. Calidades del manifiesto (usando picta-dl)
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("NUVOLA", [["ORIGIN", "Picta"], ["STATUS", "Obteniendo calidades..."]]));
-    const qualities = await getPictaQualities(url);
+    const qualities = await getPictaQualities(videoData.url_manifiesto);
     
-    const meta = extractPictaMeta(info);
     const kb = new InlineKeyboard();
     if (qualities.length > 0) {
       qualities.forEach((q, i) => { kb.text(`${q.height}p`, `picta_${q.id}_${q.height}`); if ((i+1)%3===0) kb.row(); });
     } else { kb.text("Descargar", `picta_best`); }
-    pendingPlatform.set(jobKey(ctx.chat.id, statusMsgId), { type: 'picta', url, meta });
-    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("PICTA CALIDADES", [["TITLE", `<code>${info.title}</code>`]]), { reply_markup: kb });
+    
+    pendingPlatform.set(jobKey(ctx.chat.id, statusMsgId), { type: 'picta', url, meta, manifestUrl: videoData.url_manifiesto });
+    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("PICTA CALIDADES", [["TITLE", `<code>${videoData.nombre}</code>`]]), { reply_markup: kb });
   } catch (err) {
     console.error("Error en handlePicta:", err);
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("ERROR", [["CAUSE", escapeHtml(err.message)]])).catch(() => {});
@@ -259,7 +310,7 @@ async function handleYouTube(ctx, url) {
     const meta = extractYoutubeMeta(info);
     const kb = new InlineKeyboard();
     if (qualities.length > 0) {
-      qualities.forEach((q, i) => { kb.text(`${q.height}p`, `yt_${q.id}_${q.height}`); if ((i+1)%3===0) kb.row(); });
+      qualities.forEach((q, i) => { kb.text(`${q.height}p`, `yt_${q.height}`); if ((i+1)%3===0) kb.row(); });
     } else { kb.text("Descargar", `yt_best`); }
     pendingPlatform.set(jobKey(ctx.chat.id, statusMsgId), { type: 'youtube', url, meta });
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("YOUTUBE CALIDADES", [["TITLE", `<code>${info.title}</code>`]]), { reply_markup: kb });
@@ -312,7 +363,7 @@ async function handleTelegramFile(ctx) {
 }
 
 // --- Callbacks ---
-bot.callbackQuery(/^picta_(\d+)_(\d+)$/, async (ctx) => {
+bot.callbackQuery(/^picta_([a-z0-9-]+)_(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery({ text: "Iniciando descarga..." });
   const formatId = ctx.match[1]; const height = ctx.match[2];
   const statusMsgId = ctx.callbackQuery.message.message_id;
@@ -323,7 +374,7 @@ bot.callbackQuery(/^picta_best$/, async (ctx) => {
   const statusMsgId = ctx.callbackQuery.message.message_id;
   processPicta(ctx, statusMsgId, null, "Mejor").catch(console.error);
 });
-bot.callbackQuery(/^yt_(\d+)_(\d+)$/, async (ctx) => {
+bot.callbackQuery(/^yt_(\d+)$/, async (ctx) => {
   await ctx.answerCallbackQuery({ text: "Iniciando descarga..." });
   const quality = ctx.match[1];
   const statusMsgId = ctx.callbackQuery.message.message_id;
@@ -350,7 +401,14 @@ async function processPicta(ctx, statusMsgId, formatId, qualityLabel) {
   const newStatusId = (await ctx.reply(`Iniciando descarga ${qualityLabel}...`)).message_id;
   const dest = path.join(TMP_DIR, `${Date.now()}.mp4`);
   try {
-    await downloadPictaVideo(pending.url, formatId, dest, ctx, ctx.chat.id, newStatusId, pending.meta.title);
+    if (!formatId) {
+      // Si es "best", obtener la mejor calidad
+      const qualities = await getPictaQualities(pending.manifestUrl);
+      if (qualities.length === 0) throw new Error("No hay calidades disponibles");
+      formatId = qualities[0].id;
+      qualityLabel = `${qualities[0].height}p`;
+    }
+    await downloadPictaVideo(pending.manifestUrl, formatId, dest, ctx, ctx.chat.id, newStatusId, pending.meta.title);
     const stat = fs.statSync(dest);
     const { url: s3Url } = await uploadToS3(dest, `${sanitize(pending.meta.title)}_${qualityLabel}.mp4`, ctx, ctx.chat.id, newStatusId);
     fs.unlinkSync(dest);
@@ -359,6 +417,7 @@ async function processPicta(ctx, statusMsgId, formatId, qualityLabel) {
     await ctx.api.editMessageText(ctx.chat.id, newStatusId, `Error: ${escapeHtml(err.message)}`).catch(() => {});
   }
 }
+
 async function processYoutube(ctx, statusMsgId, quality) {
   const key = jobKey(ctx.chat.id, statusMsgId);
   const pending = pendingPlatform.get(key);
@@ -403,4 +462,4 @@ bot.command("start", async (ctx) => {
   ]));
 });
 bot.start();
-console.log("Nuvola listo (con escapeHtml en errores)");
+console.log("Nuvola listo (API + picta-dl)");
