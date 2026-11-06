@@ -28,12 +28,11 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -U "yt-dlp[default,curl-cffi]"
 
-      - name: Descargar e instalar picta-dlp (vía ZIP)
+      - name: Clonar e instalar picta-dlp
         timeout-minutes: 5
         run: |
-          curl -L -o /tmp/picta.zip https://github.com/miguelorlandos06/picta-dlp/archive/refs/heads/main.zip
-          unzip -q /tmp/picta.zip -d /tmp/
-          cd /tmp/picta-dlp-main
+          git clone --depth 1 https://github.com/miguelorlandos06/picta-dlp.git /tmp/picta-dlp
+          cd /tmp/picta-dlp
           python -m pip install -v .
 
       - name: Instalar dependencias de Python
