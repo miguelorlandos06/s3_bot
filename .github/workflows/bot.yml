@@ -1,4 +1,4 @@
-name: Node Bot
+name: Nuvola Bot (Python)
 
 on:
   workflow_dispatch:
@@ -15,24 +15,30 @@ jobs:
     timeout-minutes: 235
     steps:
       - uses: actions/checkout@v4
-      - uses: actions/setup-node@v4
+
+      - uses: actions/setup-python@v5
         with:
-          node-version: '22'
+          python-version: '3.12'
 
-      - name: Instalar yt-dlp y ffmpeg
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y ffmpeg python3-pip
-          python3 -m pip install -U "yt-dlp[default,curl-cffi]"
-
-      - name: Instalar picta-dlp (privado)
+      - name: Instalar yt-dlp, ffmpeg y picta-dl
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
-          python3 -m pip install -U "git+https://${GH_TOKEN}@github.com/miguelorlandos06/picta-dlp.git"
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          python -m pip install -U "yt-dlp[default,curl-cffi]"
+          python -m pip install -U "git+https://${GH_TOKEN}@github.com/miguelorlandos06/picta-dl.git"
 
-      - name: Instalar dependencias de Node
-        run: npm install
+      - name: Instalar dependencias de Python
+        run: python -m pip install -r requirements.txt
+
+      - name: Verificar binarios
+        run: |
+          which yt-dlp
+          which picta-dl
+          yt-dlp --version
+          picta-dl --version || true
 
       - name: Preparar cookies yt-dlp
         run: |
@@ -51,10 +57,10 @@ jobs:
           PICTA_PASS: ${{ secrets.PICTA_PASS }}
         run: |
           mkdir -p "$TODUS_TMP"
-          node index.js
+          python bot.py
 
       - name: Relanzar bot automáticamente
-        if: always()
+        if: success() || cancelled()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
