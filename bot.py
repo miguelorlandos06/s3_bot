@@ -15,6 +15,52 @@ from telegram.ext import (
     Application, CallbackQueryHandler, CommandHandler, ContextTypes, MessageHandler, filters,
 )
 
+# --- NUEVO: DraftStreamer para actualizaciones fluidas ---
+class DraftStreamer:
+    def __init__(self, bot, chat_id, message_id, render_func, cancel_kb_func):
+        self.bot = bot
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.render_func = render_func
+        self.cancel_kb_func = cancel_kb_func
+        self.draft_id = int(time.time() * 1000) % 2147483647
+        self.last_update = 0.0
+        self.use_draft = True
+        self.last_pct = -1
+
+    async def update(self, phase, current, total, start_time, filename=None, force=False):
+        now = time.monotonic()
+        pct = int((current / total) * 100) if total > 0 else 0
+
+        if not force and (now - self.last_update < 0.25):
+            if pct == self.last_pct: return
+        if pct == self.last_pct and not force: return
+
+        self.last_update = now
+        self.last_pct = pct
+        text = self.render_func(phase, current, total, start_time, filename)
+
+        if self.use_draft:
+            try:
+                await self.bot.api.post("sendMessageDraft", {
+                    "chat_id": self.chat_id, "draft_id": self.draft_id,
+                    "text": text, "parse_mode": "HTML"
+                })
+                return
+            except Exception as e:
+                err = str(e).lower()
+                if "flood" in err or "not found" in err or "method" in err:
+                    self.use_draft = False
+                else:
+                    return
+
+        try:
+            await self.bot.edit_message_text(
+                chat_id=self.chat_id, message_id=self.message_id,
+                text=text, parse_mode="HTML", reply_markup=self.cancel_kb_func()
+            )
+        except Exception: pass
+
 BOT_TOKEN         = os.environ["BOT_TOKEN"]
 S3_BASE_URL       = os.environ.get("S3_BASE_URL", "https://s3.todus.cu")
 TMP_DIR           = Path(os.environ.get("TODUS_TMP", Path(__file__).parent / "tmp"))
@@ -96,23 +142,17 @@ async def run_capture(*cmd, timeout=120) -> str:
         raise RuntimeError(f"{cmd[0]} falló: {err.decode(errors='ignore')[:400]}")
     return out.decode(errors="ignore")
 
-# --- S3 (MinIO) Streaming Nativo ---
 class StreamToS3:
-    """Simula un archivo para requests y usa Content-Length en lugar de chunked (compatible con MinIO)."""
     def __init__(self, response, total, callback):
-        self.response = response
-        self.total = total
-        self.callback = callback
-        self.received = 0
-        self.last_update = 0.0
-        self.start = time.monotonic()
+        self.response = response; self.total = total; self.callback = callback
+        self.received = 0; self.last_update = 0.0; self.start = time.monotonic()
 
     def read(self, size=-1):
         chunk = self.response.raw.read(size if size > 0 else 64 * 1024)
         if not chunk: return b""
         self.received += len(chunk)
         now = time.monotonic()
-        if now - self.last_update > 1.5:
+        if now - self.last_update > 0.25:
             self.last_update = now
             self.callback(self.received, self.total)
         return chunk
@@ -120,18 +160,13 @@ class StreamToS3:
 def pipe_to_s3_sync(source_url, s3_url, total_hint, progress_cb):
     src = sync_requests.get(source_url, stream=True, timeout=30)
     if src.status_code >= 400:
-        src.close()
-        raise RuntimeError(f"HTTP {src.status_code} al descargar")
-    
+        src.close(); raise RuntimeError(f"HTTP {src.status_code} al descargar")
     total = total_hint or int(src.headers.get("content-length") or 0)
     stream_obj = StreamToS3(src, total, progress_cb)
-    
     headers = {"Content-Type": "application/octet-stream", "Content-Length": str(total)}
     put = sync_requests.put(s3_url, data=stream_obj, headers=headers, timeout=120)
     src.close()
-    
-    if put.status_code >= 400:
-        raise RuntimeError(f"S3 respondió {put.status_code}: {put.text[:200]}")
+    if put.status_code >= 400: raise RuntimeError(f"S3 respondió {put.status_code}")
     return stream_obj.received
 
 async def pipe_to_s3(source_url, filename, bot, chat_id, status_id, total_hint=0):
@@ -139,99 +174,47 @@ async def pipe_to_s3(source_url, filename, bot, chat_id, status_id, total_hint=0
     start = time.monotonic()
     state = {"last": 0.0, "sent": 0, "total": total_hint}
 
+    streamer = DraftStreamer(bot, chat_id, status_id, render_progress, lambda: cancel_keyboard(job_key(chat_id, status_id)))
+
     def progress_cb(received, total):
-        state["sent"] = received
-        state["total"] = total
-        now = time.monotonic()
-        if now - state["last"] > 1.5:
-            state["last"] = now
-            asyncio.create_task(safe_edit(
-                bot, chat_id, status_id,
-                render_progress("STREAMING", received, total, start, filename),
-                cancel_keyboard(job_key(chat_id, status_id))
-            ))
+        state["sent"] = received; state["total"] = total
+        asyncio.create_task(streamer.update("STREAMING", received, total, start, filename))
 
     try:
         await asyncio.to_thread(pipe_to_s3_sync, source_url, s3_url, total_hint, progress_cb)
-        await safe_edit(
-            bot, chat_id, status_id,
-            render_progress("STREAMING", state["sent"], state["total"], start, filename),
-            cancel_keyboard(job_key(chat_id, status_id))
-        )
+        await streamer.update("STREAMING", state["sent"], state["total"], start, filename, force=True)
     except Exception as e:
         raise e
     return {"url": s3_url, "size": state["sent"]}
 
-# --- PICTA CON -J ---
 async def handle_picta(update, context, url):
-    chat_id = update.effective_chat.id
-    bot = context.bot
+    chat_id, bot = update.effective_chat.id, context.bot
     msg = await update.message.reply_text(render_box("NUVOLA", [("ORIGIN", "Picta"), ("STATUS", "Conectando...")]), parse_mode=ParseMode.HTML)
     status_id = msg.message_id
     try:
         await safe_edit(bot, chat_id, status_id, render_box("NUVOLA", [("ORIGIN", "Picta"), ("STATUS", "Obteniendo metadatos...")]))
         out = await run_capture("picta-dlp", "-u", PICTA_USER, "-p", PICTA_PASS, "-J", url)
         data = json.loads(out)
-        
         meta = {
-            "title": data.get("title"),
-            "thumbnail": data.get("thumbnail"),
-            "synopsis": data.get("description"),
-            "duration": data.get("duration"),
-            "uploader": data.get("uploader"),
-            "tipologia": data.get("tipologia") or "Video",
+            "title": data.get("title"), "thumbnail": data.get("thumbnail"),
+            "synopsis": data.get("description"), "duration": data.get("duration"),
+            "uploader": data.get("uploader"), "tipologia": data.get("tipologia") or "Video",
         }
-
         rows, row = [], []
         for f in data.get("formatos", []):
             if f["tipo"] == "video":
                 h = f["resolucion"].split("x")[1]
                 row.append(InlineKeyboardButton(f"{h}p", callback_data=f"picta_vid_{f['id']}_{h}"))
-                if len(row) == 3:
-                    rows.append(row); row = []
+                if len(row) == 3: rows.append(row); row = []
         if row: rows.append(row)
-        
         pending_platform[job_key(chat_id, status_id)] = {"type": "picta", "url": url, "meta": meta}
-        
         info_text = render_box("PICTA INFO", [
-            ("TITLE", f"<code>{escape_html(meta['title'])}</code>"),
-            ("TIPO", meta['tipologia']),
-            ("DURACION", meta['duration'] or '-'),
-            ("UPLOADER", meta['uploader'] or '-')
+            ("TITLE", f"<code>{escape_html(meta['title'])}</code>"), ("TIPO", meta['tipologia']),
+            ("DURACION", meta['duration'] or '-'), ("UPLOADER", meta['uploader'] or '-')
         ])
         await safe_edit(bot, chat_id, status_id, info_text, keyboard=InlineKeyboardMarkup(rows))
     except Exception as e:
-        print("handle_picta:", e)
         await safe_edit(bot, chat_id, status_id, render_box("ERROR", [("CAUSE", escape_html(str(e)))]))
-
-async def download_picta_video(url, format_id, dest, bot, chat_id, status_id, filename):
-    args = ["picta-dlp", "-u", PICTA_USER, "-p", PICTA_PASS, "-o", str(dest.parent), "-f", format_id, url]
-    start = time.monotonic()
-    proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
-    active_jobs[job_key(chat_id, status_id)] = proc
-    
-    async def reader():
-        last = 0.0
-        async for raw in proc.stdout:
-            m = re.search(rb"PROGRESO:(\d+)/(\d+)", raw)
-            if not m: continue
-            done, total = int(m.group(1)), int(m.group(2))
-            now = time.monotonic()
-            if now - last < 1.5: continue
-            last = now
-            speed = done / (now - start) if (now - start) else 0
-            text = render_box("DESCARGANDO", [
-                ("NAME", escape_html(filename)), ("", f"[{progress_bar(done/total*100)}]"),
-                ("SEGMENTOS", f"{done}/{total}"), ("VELOCIDAD", f"{speed:.1f} seg/s")
-            ])
-            await safe_edit(bot, chat_id, status_id, text, cancel_keyboard(job_key(chat_id, status_id)))
-            
-    try:
-        await asyncio.gather(reader(), proc.wait())
-        if proc.returncode != 0: raise RuntimeError("Falló la descarga de Picta")
-        return dest
-    finally:
-        active_jobs.pop(job_key(chat_id, status_id), None)
 
 async def process_picta(context, chat_id, status_id, fmt_id, quality_label):
     key = job_key(chat_id, status_id)
@@ -244,9 +227,24 @@ async def process_picta(context, chat_id, status_id, fmt_id, quality_label):
     new_id = (await bot.send_message(chat_id, f"Iniciando descarga {quality_label}...")).message_id
     dest_dir = TMP_DIR / f"{int(time.time() * 1000)}"
     dest_dir.mkdir()
+    streamer = DraftStreamer(bot, chat_id, new_id, render_progress, lambda: cancel_keyboard(key))
     
     try:
-        await download_picta_video(pending["url"], fmt_id, dest_dir / "out", bot, chat_id, new_id, pending["meta"]["title"])
+        args = ["picta-dlp", "-u", PICTA_USER, "-p", PICTA_PASS, "-o", str(dest_dir), "-f", fmt_id, pending["url"]]
+        start = time.monotonic()
+        proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        active_jobs[key] = proc
+        
+        async def reader():
+            async for raw in proc.stdout:
+                m = re.search(rb"PROGRESO:(\d+)/(\d+)", raw)
+                if m:
+                    done, total = int(m.group(1)), int(m.group(2))
+                    await streamer.update("DESCARGANDO", done, total, start, pending["meta"]["title"])
+        
+        await asyncio.gather(reader(), proc.wait())
+        if proc.returncode != 0: raise RuntimeError("Falló la descarga de Picta")
+        
         files = list(dest_dir.glob("*.mp4"))
         if not files: raise RuntimeError("No se encontró el archivo descargado")
         file_path = files[0]
@@ -257,11 +255,10 @@ async def process_picta(context, chat_id, status_id, fmt_id, quality_label):
     except Exception as e:
         await safe_edit(bot, chat_id, new_id, f"Error: {escape_html(str(e))}")
     finally:
-        shutil.rmtree(dest_dir, ignore_errors=True)
+        active_jobs.pop(key, None); shutil.rmtree(dest_dir, ignore_errors=True)
 
 async def handle_youtube(update, context, url):
-    chat_id = update.effective_chat.id
-    bot = context.bot
+    chat_id, bot = update.effective_chat.id, context.bot
     msg = await update.message.reply_text(render_box("NUVOLA", [("ORIGIN", "YouTube"), ("STATUS", "Conectando...")]), parse_mode=ParseMode.HTML)
     status_id = msg.message_id
     try:
@@ -275,13 +272,11 @@ async def handle_youtube(update, context, url):
         for line in (await run_capture(*ytdlp_args(["-F", url]))).splitlines():
             m = re.search(r"(\d{3,4})x(\d{3,4})", line)
             if m and 144 <= int(m.group(2)) <= 2160: qualities.add(int(m.group(2)))
-        
         rows, row = [], []
         for h in sorted(qualities, reverse=True):
             row.append(InlineKeyboardButton(f"{h}p", callback_data=f"yt_{h}"))
             if len(row) == 3: rows.append(row); row = []
         if row: rows.append(row)
-        
         pending_platform[job_key(chat_id, status_id)] = {"type": "youtube", "url": url, "meta": meta}
         await safe_edit(bot, chat_id, status_id, render_box("YOUTUBE INFO", [("TITLE", f"<code>{escape_html(meta['title'])}</code>"), ("DURACION", meta['duration'] or '-')]), keyboard=InlineKeyboardMarkup(rows))
     except Exception as e:
@@ -296,27 +291,22 @@ async def process_youtube(context, chat_id, status_id, quality):
     try: await bot.delete_message(chat_id, status_id)
     except Exception: pass
     new_id = (await bot.send_message(chat_id, f"Iniciando descarga {label}...")).message_id
-    
     dest = TMP_DIR / f"{int(time.time() * 1000)}.mp4"
+    streamer = DraftStreamer(bot, chat_id, new_id, render_progress, lambda: cancel_keyboard(key))
+    
     fmt = "bestvideo+bestaudio/best" if quality == "best" else f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
     args = ytdlp_args(["-f", fmt, "--merge-output-format", "mp4", "--newline", "-o", str(dest), "--add-header", "User-Agent:Mozilla/5.0", pending["url"]])
-    
     start = time.monotonic()
     proc = await asyncio.create_subprocess_exec(*args, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
     active_jobs[key] = proc
     rx = re.compile(rb"\[download\]\s+(\d+\.\d+)%\s+of\s+~?\s*([\d.]+)(KiB|MiB|GiB)")
-    last = 0.0
     async def reader():
-        nonlocal last
         async for raw in proc.stderr:
             m = rx.search(raw)
-            if not m: continue
-            pct, size, unit = float(m.group(1)), float(m.group(2)), m.group(3).decode()
-            total = size * {"KiB":1024, "MiB":1024**2, "GiB":1024**3}[unit]
-            now = time.monotonic()
-            if now - last < 1.5: continue
-            last = now
-            await safe_edit(bot, chat_id, new_id, render_progress("DOWNLOADING", total*pct/100, total, start, pending["meta"]["title"]), cancel_keyboard(key))
+            if m:
+                pct, size, unit = float(m.group(1)), float(m.group(2)), m.group(3).decode()
+                total = size * {"KiB":1024, "MiB":1024**2, "GiB":1024**3}[unit]
+                await streamer.update("DOWNLOADING", total*pct/100, total, start, pending["meta"]["title"])
     try:
         await asyncio.gather(reader(), proc.wait())
         if proc.returncode != 0: raise RuntimeError("yt-dlp falló")
@@ -328,19 +318,19 @@ async def process_youtube(context, chat_id, status_id, quality):
     finally:
         active_jobs.pop(key, None); dest.unlink(missing_ok=True)
 
-# --- S3 Upload (Para Picta y YouTube que usan aiohttp) ---
 async def upload_to_s3(session, local_path, filename, bot, chat_id, status_id):
     total = local_path.stat().st_size
     start, last, sent = time.monotonic(), 0.0, 0
     url = f"{S3_BASE_URL}/stream/{int(time.time() * 1000)}_{sanitize(filename)}"
+    streamer = DraftStreamer(bot, chat_id, status_id, render_progress, lambda: cancel_keyboard(job_key(chat_id, status_id)))
     async def gen():
         nonlocal sent, last
         with open(local_path, "rb") as f:
             while chunk := f.read(64 * 1024):
                 sent += len(chunk)
-                if time.monotonic() - last > 1.5:
+                if time.monotonic() - last > 0.25:
                     last = time.monotonic()
-                    await safe_edit(bot, chat_id, status_id, render_progress("UPLOADING", sent, total, start, filename), cancel_keyboard(job_key(chat_id, status_id)))
+                    await streamer.update("UPLOADING", sent, total, start, filename)
                 yield chunk
     async with session.put(url, data=gen(), headers={"Content-Type": "video/mp4"}) as r:
         if r.status >= 400: raise RuntimeError(f"S3 respondió {r.status}")
@@ -353,8 +343,7 @@ async def send_final_card(bot, chat_id, status_id, meta, s3_url, size, quality):
     if meta.get("tipologia"): lines.append(f"Tipo: {meta['tipologia']}")
     if meta.get("duration"): lines.append(f"Duración: {meta['duration']}")
     if meta.get("uploader"): lines.append(f"Uploader: {meta['uploader']}")
-    if meta.get("synopsis"):
-        lines += ["", f"<blockquote expandable>{escape_html(meta['synopsis'])}</blockquote>"]
+    if meta.get("synopsis"): lines += ["", f"<blockquote expandable>{escape_html(meta['synopsis'])}</blockquote>"]
     lines += ["", f"Tamaño: {format_size(size)}"]
     
     thumb = meta.get("thumbnail")
@@ -371,7 +360,6 @@ async def send_final_card(bot, chat_id, status_id, meta, s3_url, size, quality):
         try: await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception: pass
 
-# --- Handlers: Enlaces y Telegram ---
 async def handle_direct_link(update, context, url, host, filename):
     chat_id, bot = update.effective_chat.id, context.bot
     status = await update.message.reply_text(render_box("NUVOLA", [("ORIGIN", host), ("NAME", filename)]), parse_mode=ParseMode.HTML)
@@ -406,13 +394,10 @@ async def handle_telegram_file(update, context):
 async def on_callback(update, context):
     q = update.callback_query
     data, chat_id, status_id = q.data, q.message.chat_id, q.message.message_id
-    
     m = re.fullmatch(r"picta_vid_([\w-]+)_(\d+)", data)
-    if m:
-        await q.answer(); asyncio.create_task(process_picta(context, chat_id, status_id, m.group(1), f"{m.group(2)}p")); return
+    if m: await q.answer(); asyncio.create_task(process_picta(context, chat_id, status_id, m.group(1), f"{m.group(2)}p")); return
     m = re.fullmatch(r"yt_(\d+)", data)
-    if m:
-        await q.answer(); asyncio.create_task(process_youtube(context, chat_id, status_id, m.group(1))); return
+    if m: await q.answer(); asyncio.create_task(process_youtube(context, chat_id, status_id, m.group(1))); return
     m = re.fullmatch(r"cancel:(.+)", data)
     if m:
         proc = active_jobs.get(m.group(1))
@@ -440,7 +425,7 @@ def main():
     app.add_handler(CallbackQueryHandler(on_callback))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, on_text))
     app.add_handler(MessageHandler(filters.Document.ALL | filters.VIDEO | filters.AUDIO | filters.PHOTO | filters.ANIMATION, handle_telegram_file))
-    print("Nuvola listo (Python + picta-dlp + JSON)")
+    print("Nuvola listo (Python + picta-dlp + JSON + Streaming)")
     app.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
