@@ -69,7 +69,7 @@ async function getPictaInfo(url) {
   return JSON.parse(stdout);
 }
 async function getPictaQualities(url) {
-  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-F", url], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
+  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "-F", url], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
   const formats = [];
   for (const line of stdout.split("\n")) {
     const match = line.match(/(\d+)\s+video\s+(\d{3,4})x(\d{3,4})/);
@@ -78,7 +78,7 @@ async function getPictaQualities(url) {
   return Array.from(new Map(formats.map(f => [f.height, f])).values()).sort((a, b) => b.height - a.height);
 }
 async function downloadPictaVideo(url, formatId, dest, ctx, chatId, statusMsgId, filename) {
-  const args = ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-f", formatId, "--audio-lang", "und", "-o", dest, url];
+  const args = ["-u", PICTA_USER, "-p", PICTA_PASS, "-f", formatId, "--audio-lang", "und", "-o", dest, url];
   return new Promise((resolve, reject) => {
     const child = execFile("picta-dlp", args, { maxBuffer: 64 * 1024 * 1024 });
     child.on("close", (code) => code === 0 ? resolve(dest) : reject(new Error(`picta-dlp falló (${code})`)));
