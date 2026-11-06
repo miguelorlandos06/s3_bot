@@ -8,6 +8,7 @@ from urllib.parse import urlparse
 import shutil
 
 import aiohttp
+import requests as sync_requests
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
 from telegram.ext import (
@@ -95,6 +96,73 @@ async def run_capture(*cmd, timeout=120) -> str:
         raise RuntimeError(f"{cmd[0]} falló: {err.decode(errors='ignore')[:400]}")
     return out.decode(errors="ignore")
 
+# --- S3 (MinIO) Streaming Nativo ---
+class StreamToS3:
+    """Simula un archivo para requests y usa Content-Length en lugar de chunked (compatible con MinIO)."""
+    def __init__(self, response, total, callback):
+        self.response = response
+        self.total = total
+        self.callback = callback
+        self.received = 0
+        self.last_update = 0.0
+        self.start = time.monotonic()
+
+    def read(self, size=-1):
+        chunk = self.response.raw.read(size if size > 0 else 64 * 1024)
+        if not chunk: return b""
+        self.received += len(chunk)
+        now = time.monotonic()
+        if now - self.last_update > 1.5:
+            self.last_update = now
+            self.callback(self.received, self.total)
+        return chunk
+
+def pipe_to_s3_sync(source_url, s3_url, total_hint, progress_cb):
+    src = sync_requests.get(source_url, stream=True, timeout=30)
+    if src.status_code >= 400:
+        src.close()
+        raise RuntimeError(f"HTTP {src.status_code} al descargar")
+    
+    total = total_hint or int(src.headers.get("content-length") or 0)
+    stream_obj = StreamToS3(src, total, progress_cb)
+    
+    headers = {"Content-Type": "application/octet-stream", "Content-Length": str(total)}
+    put = sync_requests.put(s3_url, data=stream_obj, headers=headers, timeout=120)
+    src.close()
+    
+    if put.status_code >= 400:
+        raise RuntimeError(f"S3 respondió {put.status_code}: {put.text[:200]}")
+    return stream_obj.received
+
+async def pipe_to_s3(source_url, filename, bot, chat_id, status_id, total_hint=0):
+    s3_url = f"{S3_BASE_URL}/stream/{int(time.time() * 1000)}_{sanitize(filename)}"
+    start = time.monotonic()
+    state = {"last": 0.0, "sent": 0, "total": total_hint}
+
+    def progress_cb(received, total):
+        state["sent"] = received
+        state["total"] = total
+        now = time.monotonic()
+        if now - state["last"] > 1.5:
+            state["last"] = now
+            asyncio.create_task(safe_edit(
+                bot, chat_id, status_id,
+                render_progress("STREAMING", received, total, start, filename),
+                cancel_keyboard(job_key(chat_id, status_id))
+            ))
+
+    try:
+        await asyncio.to_thread(pipe_to_s3_sync, source_url, s3_url, total_hint, progress_cb)
+        await safe_edit(
+            bot, chat_id, status_id,
+            render_progress("STREAMING", state["sent"], state["total"], start, filename),
+            cancel_keyboard(job_key(chat_id, status_id))
+        )
+    except Exception as e:
+        raise e
+    return {"url": s3_url, "size": state["sent"]}
+
+# --- PICTA CON -J ---
 async def handle_picta(update, context, url):
     chat_id = update.effective_chat.id
     bot = context.bot
@@ -260,6 +328,7 @@ async def process_youtube(context, chat_id, status_id, quality):
     finally:
         active_jobs.pop(key, None); dest.unlink(missing_ok=True)
 
+# --- S3 Upload (Para Picta y YouTube que usan aiohttp) ---
 async def upload_to_s3(session, local_path, filename, bot, chat_id, status_id):
     total = local_path.stat().st_size
     start, last, sent = time.monotonic(), 0.0, 0
@@ -302,35 +371,18 @@ async def send_final_card(bot, chat_id, status_id, meta, s3_url, size, quality):
         try: await bot.send_message(chat_id=chat_id, text="\n".join(lines), parse_mode=ParseMode.HTML, reply_markup=kb)
         except Exception: pass
 
-async def download_direct(session, url, dest, total, bot, chat_id, status_id, filename, state):
-    start = time.monotonic()
-    async with session.get(url) as r:
-        if r.status >= 400: raise RuntimeError(f"HTTP {r.status}")
-        known = total or int(r.headers.get("content-length") or 0)
-        received = 0
-        with open(dest, "wb") as f:
-            async for chunk in r.content.iter_chunked(64 * 1024):
-                f.write(chunk); received += len(chunk)
-                if time.monotonic() - state["last"] > 1.5:
-                    state["last"] = time.monotonic()
-                    await safe_edit(bot, chat_id, status_id, render_progress("DOWNLOADING", received, known, start, filename), cancel_keyboard(job_key(chat_id, status_id)))
-    return {"received": received, "total": known or received}
-
+# --- Handlers: Enlaces y Telegram ---
 async def handle_direct_link(update, context, url, host, filename):
     chat_id, bot = update.effective_chat.id, context.bot
     status = await update.message.reply_text(render_box("NUVOLA", [("ORIGIN", host), ("NAME", filename)]), parse_mode=ParseMode.HTML)
     status_id = status.message_id
     key = job_key(chat_id, status_id)
     await safe_edit(bot, chat_id, status_id, render_box("NUVOLA", [("ORIGIN", host), ("NAME", filename)]), cancel_keyboard(key))
-    dest = TMP_DIR / f"{int(time.time() * 1000)}.bin"
     try:
-        async with aiohttp.ClientSession() as session:
-            await download_direct(session, url, dest, 0, bot, chat_id, status_id, filename, {"last": 0.0})
-            info = await upload_to_s3(session, dest, filename, bot, chat_id, status_id)
+        info = await pipe_to_s3(url, filename, bot, chat_id, status_id)
         await safe_edit(bot, chat_id, status_id, render_box("COMPLETED", [("NAME", filename), ("SIZE", format_size(info["size"])), ("URL", info["url"])]), keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("Descargar", url=info["url"])]]))
     except Exception as e:
         await safe_edit(bot, chat_id, status_id, render_box("ERROR", [("CAUSE", escape_html(str(e)))]))
-    finally: dest.unlink(missing_ok=True)
 
 async def handle_telegram_file(update, context):
     msg = update.message
@@ -343,17 +395,13 @@ async def handle_telegram_file(update, context):
     status_id = status.message_id
     key = job_key(chat_id, status_id)
     await safe_edit(bot, chat_id, status_id, render_box("NUVOLA", [("ORIGIN", "Telegram"), ("NAME", filename)]), cancel_keyboard(key))
-    dest = TMP_DIR / f"{int(time.time() * 1000)}.bin"
     try:
         tg_file = await media.get_file()
         url = tg_file.file_path if tg_file.file_path.startswith("http") else f"https://api.telegram.org/file/bot{BOT_TOKEN}/{tg_file.file_path}"
-        async with aiohttp.ClientSession() as session:
-            await download_direct(session, url, dest, total, bot, chat_id, status_id, filename, {"last": 0.0})
-            info = await upload_to_s3(session, dest, filename, bot, chat_id, status_id)
+        info = await pipe_to_s3(url, filename, bot, chat_id, status_id, total_hint=total)
         await safe_edit(bot, chat_id, status_id, render_box("COMPLETED", [("NAME", filename), ("SIZE", format_size(info["size"])), ("URL", info["url"])]), keyboard=InlineKeyboardMarkup([[InlineKeyboardButton("Descargar", url=info["url"])]]))
     except Exception as e:
         await safe_edit(bot, chat_id, status_id, render_box("ERROR", [("CAUSE", escape_html(str(e)))]))
-    finally: dest.unlink(missing_ok=True)
 
 async def on_callback(update, context):
     q = update.callback_query
