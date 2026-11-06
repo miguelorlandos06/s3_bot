@@ -63,13 +63,13 @@ function ytdlpArgs(extra = []) {
   return args;
 }
 
-// --- Picta (usando picta-dlp) ---
+// --- Picta (usando picta-dlp con timeout) ---
 async function getPictaInfo(url) {
-  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "-J", url], { maxBuffer: 64 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "-J", url], { maxBuffer: 64 * 1024 * 1024, timeout: 60000 });
   return JSON.parse(stdout);
 }
 async function getPictaQualities(url) {
-  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-F", url], { maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("picta-dlp", ["-u", PICTA_USER, "-p", PICTA_PASS, "--no-playlist", "-F", url], { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
   const formats = [];
   for (const line of stdout.split("\n")) {
     const match = line.match(/(\d+)\s+video\s+(\d{3,4})x(\d{3,4})/);
@@ -102,7 +102,7 @@ function extractPictaMeta(info) {
 
 // --- YouTube ---
 async function getYoutubeQualities(url) {
-  const { stdout } = await execFileAsync("yt-dlp", ytdlpArgs(["-F", url]), { maxBuffer: 10 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("yt-dlp", ytdlpArgs(["-F", url]), { maxBuffer: 10 * 1024 * 1024, timeout: 60000 });
   const heights = new Set();
   for (const line of stdout.split("\n")) {
     const match = line.match(/(\d{3,4})x(\d{3,4})/);
@@ -111,7 +111,7 @@ async function getYoutubeQualities(url) {
   return Array.from(heights).sort((a, b) => a - b).map(h => ({ id: h, height: h }));
 }
 async function getYoutubeInfo(url) {
-  const { stdout } = await execFileAsync("yt-dlp", ytdlpArgs(["-J", "--no-playlist", url]), { maxBuffer: 64 * 1024 * 1024 });
+  const { stdout } = await execFileAsync("yt-dlp", ytdlpArgs(["-J", "--no-playlist", url]), { maxBuffer: 64 * 1024 * 1024, timeout: 60000 });
   return JSON.parse(stdout);
 }
 function extractYoutubeMeta(info) {
@@ -193,6 +193,7 @@ async function downloadDirect(url, destPath, total, ctx, statusMsgId, filename, 
 // --- Tarjeta Final ---
 async function sendFinalCard(ctx, chatId, statusMsgId, meta, s3Url, size, qualityLabel) {
   const kb = new InlineKeyboard().url("Descargar", s3Url);
+  
   let text = `<b>${escapeHtml(meta.title)}</b>\n\n`;
   if (meta.season) text += `Temporada: ${meta.season}\n`;
   if (meta.episode) text += `Episodio: ${meta.episode}\n`;
@@ -204,15 +205,25 @@ async function sendFinalCard(ctx, chatId, statusMsgId, meta, s3Url, size, qualit
   if (meta.cast) text += `Reparto: ${meta.cast}\n`;
   if (meta.synopsis) text += `\nSinopsis:\n<blockquote>${escapeHtml(meta.synopsis)}</blockquote>\n`;
   text += `\nTamaño: ${formatSize(size)}`;
-  try {
-    if (meta.thumbnail) {
-      await ctx.api.sendPhoto(chatId, meta.thumbnail, { caption: text, parse_mode: "HTML", reply_markup: kb });
+
+  if (meta.thumbnail) {
+    try {
+      let thumbUrl = meta.thumbnail;
+      if (thumbUrl.includes("ytimg.com") || thumbUrl.includes("youtube.com")) {
+        thumbUrl = thumbUrl.replace(/\.webp$/, ".jpg").replace(/\/webp\//, "/jpg/");
+      }
+      await ctx.api.sendPhoto(chatId, thumbUrl, { caption: text, parse_mode: "HTML", reply_markup: kb });
       await ctx.api.deleteMessage(chatId, statusMsgId).catch(() => {});
-    } else {
-      await ctx.api.editMessageText(chatId, statusMsgId, text, { parse_mode: "HTML", reply_markup: kb });
+      return;
+    } catch (e) {
+      console.error("Error al enviar foto:", e.message);
     }
+  }
+
+  try {
+    await ctx.api.editMessageText(chatId, statusMsgId, text, { parse_mode: "HTML", reply_markup: kb });
   } catch (e) {
-    await ctx.api.editMessageText(chatId, statusMsgId, text, { parse_mode: "HTML", reply_markup: kb }).catch(() => {});
+    await ctx.api.sendMessage(chatId, text, { parse_mode: "HTML", reply_markup: kb }).catch(() => {});
   }
 }
 
@@ -222,8 +233,10 @@ async function handlePicta(ctx, url) {
   try {
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("NUVOLA", [["ORIGIN", "Picta"], ["STATUS", "Buscando video..."]]));
     const info = await getPictaInfo(url);
+    
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("NUVOLA", [["ORIGIN", "Picta"], ["STATUS", "Obteniendo calidades..."]]));
     const qualities = await getPictaQualities(url);
+    
     const meta = extractPictaMeta(info);
     const kb = new InlineKeyboard();
     if (qualities.length > 0) {
@@ -232,9 +245,11 @@ async function handlePicta(ctx, url) {
     pendingPlatform.set(jobKey(ctx.chat.id, statusMsgId), { type: 'picta', url, meta });
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("PICTA CALIDADES", [["TITLE", `<code>${info.title}</code>`]]), { reply_markup: kb });
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("ERROR", [["CAUSE", err.message]]));
+    console.error("Error en handlePicta:", err);
+    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("ERROR", [["CAUSE", escapeHtml(err.message)]])).catch(() => {});
   }
 }
+
 async function handleYouTube(ctx, url) {
   const statusMsgId = (await ctx.reply(renderBox("NUVOLA", [["ORIGIN", "YouTube"], ["STATUS", "Conectando..."]]))).message_id;
   try {
@@ -249,9 +264,11 @@ async function handleYouTube(ctx, url) {
     pendingPlatform.set(jobKey(ctx.chat.id, statusMsgId), { type: 'youtube', url, meta });
     await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("YOUTUBE CALIDADES", [["TITLE", `<code>${info.title}</code>`]]), { reply_markup: kb });
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("ERROR", [["CAUSE", err.message]]));
+    console.error("Error en handleYouTube:", err);
+    await ctx.api.editMessageText(ctx.chat.id, statusMsgId, renderBox("ERROR", [["CAUSE", escapeHtml(err.message)]])).catch(() => {});
   }
 }
+
 async function handleDirectLink(ctx, url, host, filename) {
   const status = await ctx.reply(renderBox("NUVOLA", [["ORIGIN", host], ["NAME", filename]]), { reply_markup: cancelKeyboard(jobKey(ctx.chat.id, 0)) });
   const key = jobKey(ctx.chat.id, status.message_id);
@@ -266,9 +283,10 @@ async function handleDirectLink(ctx, url, host, filename) {
     const kb = new InlineKeyboard().url("Descargar", s3Url);
     await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("COMPLETED", [["NAME", filename], ["SIZE", formatSize(size)], ["URL", s3Url]]), { reply_markup: kb });
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("ERROR", [["CAUSE", err.message]]));
+    await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("ERROR", [["CAUSE", escapeHtml(err.message)]])).catch(() => {});
   }
 }
+
 async function handleTelegramFile(ctx) {
   const msg = ctx.message;
   const media = msg.document || msg.video || msg.audio || (msg.photo ? msg.photo[msg.photo.length - 1] : null) || msg.animation;
@@ -289,7 +307,7 @@ async function handleTelegramFile(ctx) {
     const kb = new InlineKeyboard().url("Descargar", s3Url);
     await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("COMPLETED", [["NAME", filename], ["SIZE", formatSize(size)], ["URL", s3Url]]), { reply_markup: kb });
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("ERROR", [["CAUSE", err.message]]));
+    await ctx.api.editMessageText(ctx.chat.id, status.message_id, renderBox("ERROR", [["CAUSE", escapeHtml(err.message)]])).catch(() => {});
   }
 }
 
@@ -338,7 +356,7 @@ async function processPicta(ctx, statusMsgId, formatId, qualityLabel) {
     fs.unlinkSync(dest);
     await sendFinalCard(ctx, ctx.chat.id, newStatusId, pending.meta, s3Url, stat.size, qualityLabel);
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, newStatusId, `Error: ${err.message}`).catch(() => {});
+    await ctx.api.editMessageText(ctx.chat.id, newStatusId, `Error: ${escapeHtml(err.message)}`).catch(() => {});
   }
 }
 async function processYoutube(ctx, statusMsgId, quality) {
@@ -357,7 +375,7 @@ async function processYoutube(ctx, statusMsgId, quality) {
     fs.unlinkSync(dest);
     await sendFinalCard(ctx, ctx.chat.id, newStatusId, pending.meta, s3Url, stat.size, label);
   } catch (err) {
-    await ctx.api.editMessageText(ctx.chat.id, newStatusId, `Error: ${err.message}`).catch(() => {});
+    await ctx.api.editMessageText(ctx.chat.id, newStatusId, `Error: ${escapeHtml(err.message)}`).catch(() => {});
   }
 }
 
@@ -385,4 +403,4 @@ bot.command("start", async (ctx) => {
   ]));
 });
 bot.start();
-console.log("Nuvola listo (monolítico)");
+console.log("Nuvola listo (con escapeHtml en errores)");
