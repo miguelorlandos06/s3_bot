@@ -28,12 +28,12 @@ jobs:
           python -m pip install --upgrade pip
           python -m pip install -U "yt-dlp[default,curl-cffi]"
 
-      - name: Clonar e instalar picta-dlp
+      - name: Instalar picta-dlp (desde carpeta local)
         timeout-minutes: 5
         run: |
-          git clone --depth 1 https://github.com/miguelorlandos06/picta-dlp.git /tmp/picta-dlp
-          cd /tmp/picta-dlp
+          cd picta-dlp
           python -m pip install -v .
+          cd ..
 
       - name: Instalar dependencias de Python
         timeout-minutes: 5

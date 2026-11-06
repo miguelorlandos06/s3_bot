@@ -1,0 +1,13 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "picta-dlp"
+version = "1.0.0"
+description = "Descargador autónomo y completo para Picta (picta.cu)"
+requires-python = ">=3.9"
+dependencies = ["requests>=2.31.0"]
+
+[project.scripts]
+picta-dlp = "picta_dlp.cli:main"
